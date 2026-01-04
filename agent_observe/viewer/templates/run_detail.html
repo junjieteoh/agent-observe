@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+
+{% block title %}Run {{ run.name if run else 'Not Found' }} - riff-observe{% endblock %}
+
+{% block content %}
+{% if error %}
+<div class="card">
+    <p style="color: var(--red);">{{ error }}</p>
+    <a href="/">← Back to runs</a>
+</div>
+{% else %}
+
+<div style="display: flex; align-items: center; gap: 16px; margin-bottom: 20px;">
+    <a href="/" style="color: var(--text-muted);">← Runs</a>
+    <h1 style="font-size: 24px;">{{ run.name }}</h1>
+    <span class="badge {{ status_color(run.status) }}">{{ run.status }}</span>
+    <span class="risk-score {{ risk_color(run.risk_score) }}">Risk: {{ run.risk_score if run.risk_score is not none else '-' }}</span>
+</div>
+
+<!-- Run Metadata -->
+<div class="card">
+    <h2>Run Details</h2>
+    <div class="meta-grid">
+        <div class="meta-item">
+            <label>Run ID</label>
+            <value style="font-family: monospace; font-size: 12px;">{{ run.run_id }}</value>
+        </div>
+        <div class="meta-item">
+            <label>Project</label>
+            <value>{{ run.project or '-' }}</value>
+        </div>
+        <div class="meta-item">
+            <label>Environment</label>
+            <value>{{ run.env or '-' }}</value>
+        </div>
+        <div class="meta-item">
+            <label>Agent Version</label>
+            <value>{{ run.agent_version or '-' }}</value>
+        </div>
+        <div class="meta-item">
+            <label>Started</label>
+            <value>{{ run.ts_start|format_timestamp }}</value>
+        </div>
+        <div class="meta-item">
+            <label>Duration</label>
+            <value>{{ run.latency_ms|format_duration }}</value>
+        </div>
+        <div class="meta-item">
+            <label>Tool Calls</label>
+            <value>{{ run.tool_calls or 0 }}</value>
+        </div>
+        <div class="meta-item">
+            <label>Model Calls</label>
+            <value>{{ run.model_calls or 0 }}</value>
+        </div>
+        <div class="meta-item">
+            <label>Policy Violations</label>
+            <value style="{% if run.policy_violations %}color: var(--red);{% endif %}">{{ run.policy_violations or 0 }}</value>
+        </div>
+    </div>
+
+    {% if run.eval_tags %}
+    <div style="margin-top: 16px;">
+        <label style="font-size: 12px; color: var(--text-muted);">Eval Tags</label>
+        <div class="tags" style="margin-top: 4px;">
+            {% for tag in run.eval_tags %}
+            <span class="tag">{{ tag }}</span>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    {% if run.task %}
+    <div style="margin-top: 16px;">
+        <label style="font-size: 12px; color: var(--text-muted);">Task</label>
+        <pre>{{ run.task | tojson(indent=2) }}</pre>
+    </div>
+    {% endif %}
+</div>
+
+<!-- Spans -->
+<div class="card">
+    <h2>Spans ({{ spans|length }})</h2>
+
+    {% if spans %}
+    <div class="span-tree">
+        {% macro render_span(span, depth=0) %}
+        <div class="span-node">
+            <div class="span-header">
+                <span class="span-indent">{{ '  ' * depth }}{% if depth > 0 %}└─{% endif %}</span>
+                <span class="badge {{ status_color(span.status) }}">{{ span.status }}</span>
+                <span class="span-name">{{ span.name }}</span>
+                <span class="span-kind">[{{ span.kind }}]</span>
+                <span class="span-duration">{{ (span.ts_end - span.ts_start)|format_duration if span.ts_end else '-' }}</span>
+            </div>
+            {% if span.attrs %}
+            <div style="margin-left: {{ 20 + depth * 16 }}px; margin-top: 4px;">
+                {% for key, value in span.attrs.items() %}
+                <span style="color: var(--text-muted); font-size: 11px;">{{ key }}={{ value }}</span>
+                {% if not loop.last %}<span style="color: var(--border);"> · </span>{% endif %}
+                {% endfor %}
+            </div>
+            {% endif %}
+            {% if span.error_message %}
+            <div style="margin-left: {{ 20 + depth * 16 }}px; margin-top: 4px; color: var(--red); font-size: 12px;">
+                Error: {{ span.error_message }}
+            </div>
+            {% endif %}
+        </div>
+        {% for child in span.children %}
+            {{ render_span(child, depth + 1) }}
+        {% endfor %}
+        {% endmacro %}
+
+        {% for span in span_tree %}
+            {{ render_span(span) }}
+        {% endfor %}
+    </div>
+    {% else %}
+    <p class="empty">No spans recorded.</p>
+    {% endif %}
+</div>
+
+<!-- Events -->
+<div class="card">
+    <h2>Events ({{ events|length }})</h2>
+
+    {% if events %}
+    <div class="events-list">
+        {% for event in events %}
+        <div class="event-item">
+            <span style="color: var(--text-muted); min-width: 80px;">{{ event.ts|format_timestamp }}</span>
+            <span class="event-type">{{ event.type }}</span>
+            <span class="event-payload">{{ event.payload | tojson }}</span>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <p class="empty">No events recorded.</p>
+    {% endif %}
+</div>
+
+{% endif %}
+{% endblock %}

@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+
+{% block title %}Runs - riff-observe{% endblock %}
+
+{% block content %}
+<h1 style="font-size: 24px; margin-bottom: 20px;">Agent Runs</h1>
+
+<form class="filters" method="get" action="/">
+    <div class="filter-group">
+        <label for="name">Name</label>
+        <input type="text" id="name" name="name" value="{{ filters.name or '' }}" placeholder="Filter by name...">
+    </div>
+
+    <div class="filter-group">
+        <label for="status">Status</label>
+        <select id="status" name="status">
+            <option value="">All</option>
+            <option value="ok" {% if filters.status == 'ok' %}selected{% endif %}>OK</option>
+            <option value="error" {% if filters.status == 'error' %}selected{% endif %}>Error</option>
+            <option value="blocked" {% if filters.status == 'blocked' %}selected{% endif %}>Blocked</option>
+        </select>
+    </div>
+
+    <div class="filter-group">
+        <label for="min_risk">Min Risk</label>
+        <input type="number" id="min_risk" name="min_risk" value="{{ filters.min_risk or '' }}" placeholder="0-100" min="0" max="100" style="width: 80px;">
+    </div>
+
+    <div class="filter-group">
+        <label for="tag">Tag</label>
+        <input type="text" id="tag" name="tag" value="{{ filters.tag or '' }}" placeholder="e.g. POLICY_VIOLATION">
+    </div>
+
+    <button type="submit">Filter</button>
+</form>
+
+{% if runs %}
+<table>
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Status</th>
+            <th>Risk</th>
+            <th>Tools</th>
+            <th>Models</th>
+            <th>Duration</th>
+            <th>Started</th>
+            <th>Tags</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for run in runs %}
+        <tr>
+            <td>
+                <a href="/run/{{ run.run_id }}">{{ run.name }}</a>
+                <div style="font-size: 11px; color: var(--text-muted);">{{ run.run_id[:8] }}...</div>
+            </td>
+            <td>
+                <span class="badge {{ status_color(run.status) }}">{{ run.status or 'unknown' }}</span>
+            </td>
+            <td>
+                <span class="risk-score {{ risk_color(run.risk_score) }}">{{ run.risk_score if run.risk_score is not none else '-' }}</span>
+            </td>
+            <td>{{ run.tool_calls or 0 }}</td>
+            <td>{{ run.model_calls or 0 }}</td>
+            <td>{{ run.latency_ms|format_duration }}</td>
+            <td>{{ run.ts_start|format_timestamp }}</td>
+            <td>
+                <div class="tags">
+                    {% for tag in run.eval_tags or [] %}
+                    <span class="tag">{{ tag }}</span>
+                    {% endfor %}
+                </div>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<div class="pagination">
+    <a href="?page={{ page - 1 }}{% if filters.name %}&name={{ filters.name }}{% endif %}{% if filters.status %}&status={{ filters.status }}{% endif %}{% if filters.min_risk %}&min_risk={{ filters.min_risk }}{% endif %}{% if filters.tag %}&tag={{ filters.tag }}{% endif %}" class="{% if not has_prev %}disabled{% endif %}">← Previous</a>
+    <span style="padding: 8px 16px; color: var(--text-muted);">Page {{ page }}</span>
+    <a href="?page={{ page + 1 }}{% if filters.name %}&name={{ filters.name }}{% endif %}{% if filters.status %}&status={{ filters.status }}{% endif %}{% if filters.min_risk %}&min_risk={{ filters.min_risk }}{% endif %}{% if filters.tag %}&tag={{ filters.tag }}{% endif %}" class="{% if not has_next %}disabled{% endif %}">Next →</a>
+</div>
+{% else %}
+<div class="empty">
+    <p>No runs found.</p>
+    <p style="margin-top: 8px;">Run your agent with <code>observe.install()</code> to start collecting data.</p>
+</div>
+{% endif %}
+{% endblock %}
