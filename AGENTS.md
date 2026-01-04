@@ -22,13 +22,48 @@ def call_llm():           model, latency           viewer UI
     ...
 ```
 
+## Configuration
+
+**Recommended: Use Config object**
+
+```python
+from agent_observe import observe
+from agent_observe.config import Config
+
+# Create config with all settings
+config = Config(
+    mode="full",           # full | evidence_only | metadata_only | off
+    env="dev",             # dev | staging | prod
+    database_url="postgresql://user:pass@host/db",  # Optional: enables PostgreSQL
+    pg_schema="public",    # PostgreSQL schema (default: public)
+)
+
+# Initialize once at startup
+observe.install(config=config)
+```
+
+**Alternative: Environment variables**
+
+```bash
+export AGENT_OBSERVE_MODE=full
+export AGENT_OBSERVE_ENV=dev
+export DATABASE_URL=postgresql://user:pass@host/db
+export AGENT_OBSERVE_PG_SCHEMA=public  # PostgreSQL schema (default: public)
+```
+
+```python
+observe.install()  # Reads from env vars automatically
+```
+
 ## Core Pattern
 
 ```python
 from agent_observe import observe, tool, model_call
+from agent_observe.config import Config
 
 # 1. Initialize once at startup
-observe.install(mode="full")  # Use "full" to see all data
+config = Config(mode="full", env="dev")
+observe.install(config=config)
 
 # 2. Wrap tools with @tool
 @tool(name="search", kind="http")
@@ -46,6 +81,8 @@ with observe.run("my-agent", task={"goal": "Research AI"}):
     analysis = call_llm(f"Analyze: {results}")
     observe.emit_artifact("output", analysis)
 ```
+
+**Important:** All `@tool` and `@model_call` decorated functions must be called **inside** `observe.run()` context.
 
 ## Decorator Reference
 
@@ -88,8 +125,9 @@ async with observe.arun("async-agent"):
 ```python
 import openai
 from agent_observe import observe, tool, model_call
+from agent_observe.config import Config
 
-observe.install(mode="full")
+observe.install(config=Config(mode="full", env="dev"))
 
 @tool(name="get_weather", kind="http")
 def get_weather(location: str) -> dict:
@@ -111,8 +149,9 @@ with observe.run("openai-agent"):
 ```python
 import anthropic
 from agent_observe import observe, model_call
+from agent_observe.config import Config
 
-observe.install(mode="full")
+observe.install(config=Config(mode="full", env="dev"))
 
 @model_call(provider="anthropic", model="claude-sonnet-4-5-20250929")
 def call_claude(messages: list):
@@ -131,8 +170,9 @@ with observe.run("claude-agent"):
 ```python
 import google.generativeai as genai
 from agent_observe import observe, model_call
+from agent_observe.config import Config
 
-observe.install(mode="full")
+observe.install(config=Config(mode="full", env="dev"))
 
 @model_call(provider="google", model="gemini-3-flash")
 def call_gemini(prompt: str):
@@ -148,8 +188,9 @@ with observe.run("gemini-agent"):
 ```python
 from langchain.tools import StructuredTool
 from agent_observe import observe, tool
+from agent_observe.config import Config
 
-observe.install(mode="full")
+observe.install(config=Config(mode="full", env="dev"))
 
 @tool(name="search", kind="http")
 def search(query: str) -> list:
@@ -172,34 +213,6 @@ with observe.run("my-agent"):
 
     # Artifacts (final outputs)
     observe.emit_artifact("report", {"content": "..."})
-```
-
-## Configuration
-
-### Simple (Recommended)
-
-```python
-# Strings work - no need for enums
-observe.install(mode="full")
-
-# Or with config
-from agent_observe.config import Config
-
-config = Config(
-    mode="full",           # Strings accepted!
-    env="dev",
-    sink_type="postgres",
-    database_url="postgresql://...",
-)
-observe.install(config=config)
-```
-
-### Environment Variables
-
-```bash
-AGENT_OBSERVE_MODE=full              # full|metadata_only|evidence_only|off
-AGENT_OBSERVE_ENV=dev                # dev|staging|prod
-DATABASE_URL=postgresql://...        # Enables Postgres
 ```
 
 ## PostgreSQL Setup
@@ -279,10 +292,10 @@ agent-observe view
 
 ## Quick Checklist
 
-1. `observe.install(mode="full")` at startup
+1. `observe.install(config=Config(mode="full", env="dev"))` at startup
 2. `@tool(name="...", kind="...")` on all tool functions
 3. `@model_call(provider="...", model="...")` on all LLM calls
-4. `observe.run("agent-name")` around agent execution
+4. `observe.run("agent-name")` around agent execution (tools must be called INSIDE this context)
 5. `observe.emit_artifact()` for final outputs
 
 ## Latest Model IDs (January 2025)

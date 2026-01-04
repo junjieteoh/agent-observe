@@ -12,6 +12,7 @@ import functools
 import logging
 from typing import Any, Callable, TypeVar, overload
 
+from agent_observe.config import CaptureMode
 from agent_observe.context import (
     SpanContext,
     SpanKind,
@@ -26,6 +27,304 @@ from agent_observe.context import (
 from agent_observe.hashing import hash_json
 
 logger = logging.getLogger(__name__)
+
+# Maximum size for content storage in evidence_only mode
+MAX_EVIDENCE_BYTES = 64 * 1024  # 64KB
+
+
+def _serialize_for_storage(value: Any, max_bytes: int | None = None) -> str | None:
+    """
+    Serialize a value for storage in span attributes.
+
+    Args:
+        value: Value to serialize.
+        max_bytes: Maximum size in bytes (None for unlimited).
+
+    Returns:
+        JSON string or None if serialization fails or exceeds limit.
+    """
+    import json
+
+    try:
+        serialized = json.dumps(value, default=str)
+        if max_bytes is not None and len(serialized.encode("utf-8")) > max_bytes:
+            return None  # Too large, skip storage
+        return serialized
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_stream(result: Any) -> bool:
+    """Check if result is a sync stream/generator (not a regular collection)."""
+    import types
+
+    # Check for sync generator type
+    if isinstance(result, types.GeneratorType):
+        return True
+
+    # Check for common streaming response types (OpenAI, Anthropic) - but not async variants
+    type_name = type(result).__name__.lower()
+    if ("stream" in type_name or "iterator" in type_name) and "async" not in type_name:
+        return True
+
+    # Check if it's iterable but NOT a string/dict/list/tuple
+    return (
+        hasattr(result, "__iter__")
+        and hasattr(result, "__next__")
+        and not isinstance(result, (str, bytes, dict, list, tuple))
+    )
+
+
+def _is_async_stream(result: Any) -> bool:
+    """Check if result is an async stream/generator."""
+    import types
+
+    # Check for async generator type
+    if isinstance(result, types.AsyncGeneratorType):
+        return True
+
+    # Check for common async streaming response types
+    type_name = type(result).__name__.lower()
+    if ("stream" in type_name or "iterator" in type_name) and "async" in type_name:
+        return True
+
+    # Check if it has async iteration protocol
+    return hasattr(result, "__aiter__") and hasattr(result, "__anext__")
+
+
+def _extract_chunk_content(chunk: Any) -> str:
+    """Extract text content from a streaming chunk."""
+    # OpenAI format
+    if hasattr(chunk, "choices") and chunk.choices:
+        delta = getattr(chunk.choices[0], "delta", None)
+        if delta and hasattr(delta, "content"):
+            return delta.content or ""
+
+    # Anthropic format
+    if hasattr(chunk, "delta") and hasattr(chunk.delta, "text"):
+        return chunk.delta.text or ""
+
+    # Dict format (generic)
+    if isinstance(chunk, dict):
+        if "choices" in chunk and chunk["choices"]:
+            delta = chunk["choices"][0].get("delta", {})
+            return delta.get("content", "")
+        if "delta" in chunk:
+            return chunk["delta"].get("text", "")
+
+    # Fallback: convert to string
+    return str(chunk) if chunk else ""
+
+
+def _format_error_context(
+    error: Exception,
+    capture_mode: CaptureMode,
+    input_data: Any = None,
+) -> dict[str, Any]:
+    """
+    Format error with context based on capture mode.
+
+    Args:
+        error: The exception that occurred.
+        capture_mode: Current capture mode.
+        input_data: Input that caused the error (for full mode).
+
+    Returns:
+        Structured error information.
+    """
+    import traceback
+
+    error_info: dict[str, Any] = {
+        "type": type(error).__name__,
+        "message": str(error),
+    }
+
+    # Add traceback for evidence_only and full modes
+    if capture_mode in (CaptureMode.EVIDENCE_ONLY, CaptureMode.FULL):
+        tb = traceback.format_exc()
+        if capture_mode == CaptureMode.EVIDENCE_ONLY:
+            # Truncate traceback in evidence mode
+            max_tb_length = 4096
+            if len(tb) > max_tb_length:
+                tb = tb[:max_tb_length] + "\n... [truncated]"
+        error_info["traceback"] = tb
+
+    # Add input context in full mode
+    if capture_mode == CaptureMode.FULL and input_data is not None:
+        input_serialized = _serialize_for_storage(input_data)
+        if input_serialized:
+            error_info["input"] = input_serialized
+
+    return error_info
+
+
+class SyncStreamWrapper:
+    """
+    Wrapper for synchronous LLM streams that records metrics while yielding chunks.
+
+    Captures:
+    - Time to first token (TTFT)
+    - Time to last token
+    - Chunk count
+    - Accumulated output (in full/evidence_only mode)
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        span: SpanContext,
+        capture_mode: CaptureMode,
+        run: Any,
+    ):
+        self._stream = stream
+        self._span = span
+        self._capture_mode = capture_mode
+        self._run = run
+        self._chunks: list[Any] = []
+        self._content_parts: list[str] = []
+        self._first_token_recorded = False
+
+    def __iter__(self) -> SyncStreamWrapper:
+        return self
+
+    def __next__(self) -> Any:
+        try:
+            chunk = next(self._stream)
+
+            # Record time to first token
+            if not self._first_token_recorded:
+                self._span.set_attribute("ts_first_token", now_ms())
+                self._first_token_recorded = True
+
+            # Accumulate chunks
+            self._chunks.append(chunk)
+            content = _extract_chunk_content(chunk)
+            if content:
+                self._content_parts.append(content)
+
+            return chunk
+
+        except StopIteration:
+            # Stream exhausted - finalize metrics
+            self._finalize()
+            raise
+        except Exception as e:
+            # Stream errored - finalize with error status
+            self._finalize_with_error(e)
+            raise
+
+    def _finalize_with_error(self, error: Exception) -> None:
+        """Record final metrics when stream errors."""
+        self._span.set_attribute("ts_last_token", now_ms())
+        self._span.set_attribute("chunk_count", len(self._chunks))
+        self._span.set_attribute("streaming", True)
+        self._span.set_status(SpanStatus.ERROR, str(error))
+        self._span.end()
+        self._run.add_span(self._span)
+
+    def _finalize(self) -> None:
+        """Record final metrics when stream is exhausted."""
+        self._span.set_attribute("ts_last_token", now_ms())
+        self._span.set_attribute("chunk_count", len(self._chunks))
+        self._span.set_attribute("streaming", True)
+
+        # Reconstruct and hash output
+        full_output = "".join(self._content_parts)
+        output_hash = hash_json(full_output)
+        self._span.set_attribute("output_hash", output_hash)
+
+        # Store content based on capture mode
+        if self._capture_mode == CaptureMode.FULL or (
+            self._capture_mode == CaptureMode.EVIDENCE_ONLY
+            and len(full_output.encode("utf-8")) <= MAX_EVIDENCE_BYTES
+        ):
+            self._span.set_attribute("output", full_output)
+
+        self._span.set_status(SpanStatus.OK)
+        self._span.end()
+        self._run.add_span(self._span)
+
+
+class AsyncStreamWrapper:
+    """
+    Wrapper for asynchronous LLM streams that records metrics while yielding chunks.
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        span: SpanContext,
+        capture_mode: CaptureMode,
+        run: Any,
+    ):
+        self._stream = stream
+        self._span = span
+        self._capture_mode = capture_mode
+        self._run = run
+        self._chunks: list[Any] = []
+        self._content_parts: list[str] = []
+        self._first_token_recorded = False
+
+    def __aiter__(self) -> AsyncStreamWrapper:
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            chunk = await self._stream.__anext__()
+
+            # Record time to first token
+            if not self._first_token_recorded:
+                self._span.set_attribute("ts_first_token", now_ms())
+                self._first_token_recorded = True
+
+            # Accumulate chunks
+            self._chunks.append(chunk)
+            content = _extract_chunk_content(chunk)
+            if content:
+                self._content_parts.append(content)
+
+            return chunk
+
+        except StopAsyncIteration:
+            # Stream exhausted - finalize metrics
+            self._finalize()
+            raise
+        except Exception as e:
+            # Stream errored - finalize with error status
+            self._finalize_with_error(e)
+            raise
+
+    def _finalize_with_error(self, error: Exception) -> None:
+        """Record final metrics when stream errors."""
+        self._span.set_attribute("ts_last_token", now_ms())
+        self._span.set_attribute("chunk_count", len(self._chunks))
+        self._span.set_attribute("streaming", True)
+        self._span.set_status(SpanStatus.ERROR, str(error))
+        self._span.end()
+        self._run.add_span(self._span)
+
+    def _finalize(self) -> None:
+        """Record final metrics when stream is exhausted."""
+        self._span.set_attribute("ts_last_token", now_ms())
+        self._span.set_attribute("chunk_count", len(self._chunks))
+        self._span.set_attribute("streaming", True)
+
+        # Reconstruct and hash output
+        full_output = "".join(self._content_parts)
+        output_hash = hash_json(full_output)
+        self._span.set_attribute("output_hash", output_hash)
+
+        # Store content based on capture mode
+        if self._capture_mode == CaptureMode.FULL or (
+            self._capture_mode == CaptureMode.EVIDENCE_ONLY
+            and len(full_output.encode("utf-8")) <= MAX_EVIDENCE_BYTES
+        ):
+            self._span.set_attribute("output", full_output)
+
+        self._span.set_status(SpanStatus.OK)
+        self._span.end()
+        self._run.add_span(self._span)
+
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -205,10 +504,33 @@ class ToolDecorator:
             result_hash = hash_json(result)
             span.set_attribute("result_hash", result_hash)
 
+            # Store actual content based on capture mode
+            capture_mode = observe.config.mode
+            if capture_mode == CaptureMode.FULL:
+                # Full mode: store everything
+                args_serialized = _serialize_for_storage(args_for_hash)
+                result_serialized = _serialize_for_storage(result)
+                if args_serialized:
+                    span.set_attribute("args", args_serialized)
+                if result_serialized:
+                    span.set_attribute("result", result_serialized)
+            elif capture_mode == CaptureMode.EVIDENCE_ONLY:
+                # Evidence mode: store with size limit
+                args_serialized = _serialize_for_storage(args_for_hash, MAX_EVIDENCE_BYTES)
+                result_serialized = _serialize_for_storage(result, MAX_EVIDENCE_BYTES)
+                if args_serialized:
+                    span.set_attribute("args", args_serialized)
+                if result_serialized:
+                    span.set_attribute("result", result_serialized)
+
             span.set_status(SpanStatus.OK)
             return result
 
         except Exception as e:
+            # Enhanced error context
+            capture_mode = observe.config.mode
+            error_context = _format_error_context(e, capture_mode, args_for_hash)
+            span.set_attribute("error_context", error_context)
             span.set_status(SpanStatus.ERROR, str(e))
             run.record_retry()  # Record as potential retry
             raise
@@ -262,10 +584,32 @@ class ToolDecorator:
             result_hash = hash_json(result)
             span.set_attribute("result_hash", result_hash)
 
+            # Store actual content based on capture mode
+            capture_mode = observe.config.mode
+            if capture_mode == CaptureMode.FULL:
+                # Full mode: store everything
+                args_serialized = _serialize_for_storage(args_for_hash)
+                result_serialized = _serialize_for_storage(result)
+                if args_serialized:
+                    span.set_attribute("args", args_serialized)
+                if result_serialized:
+                    span.set_attribute("result", result_serialized)
+            elif capture_mode == CaptureMode.EVIDENCE_ONLY:
+                # Evidence mode: store with size limit
+                args_serialized = _serialize_for_storage(args_for_hash, MAX_EVIDENCE_BYTES)
+                result_serialized = _serialize_for_storage(result, MAX_EVIDENCE_BYTES)
+                if args_serialized:
+                    span.set_attribute("args", args_serialized)
+                if result_serialized:
+                    span.set_attribute("result", result_serialized)
+
             span.set_status(SpanStatus.OK)
             return result
 
         except Exception as e:
+            # Enhanced error context
+            error_context = _format_error_context(e, capture_mode, args_for_hash)
+            span.set_attribute("error_context", error_context)
             span.set_status(SpanStatus.ERROR, str(e))
             run.record_retry()  # Record as potential retry
             raise
@@ -377,6 +721,7 @@ class ModelCallDecorator:
             return fn(*args, **kwargs)
 
         observe = run._observe
+        capture_mode = observe.config.mode
 
         # Check policies
         self._check_policies(run, observe)
@@ -387,17 +732,48 @@ class ModelCallDecorator:
         # Set as current span
         token = set_current_span(span)
 
-        try:
-            # Hash input
-            input_for_hash = {"args": args, "kwargs": kwargs}
-            input_hash = hash_json(input_for_hash)
-            span.set_attribute("input_hash", input_hash)
+        # Hash input
+        input_for_hash = {"args": args, "kwargs": kwargs}
+        input_hash = hash_json(input_for_hash)
+        span.set_attribute("input_hash", input_hash)
 
+        # Store input based on capture mode
+        if capture_mode == CaptureMode.FULL:
+            input_serialized = _serialize_for_storage(input_for_hash)
+            if input_serialized:
+                span.set_attribute("input", input_serialized)
+        elif capture_mode == CaptureMode.EVIDENCE_ONLY:
+            input_serialized = _serialize_for_storage(input_for_hash, MAX_EVIDENCE_BYTES)
+            if input_serialized:
+                span.set_attribute("input", input_serialized)
+
+        is_stream_result = False
+        try:
             result = fn(*args, **kwargs)
 
-            # Hash output
+            # Check if result is a stream
+            if _is_stream(result):
+                is_stream_result = True
+                # For streams, reset the current span context but DON'T end the span
+                # The stream wrapper will handle finalization when exhausted
+                if token is not None:
+                    reset_current_span(token)
+                return SyncStreamWrapper(result, span, capture_mode, run)
+
+            # Non-streaming: hash and store output
             output_hash = hash_json(result)
             span.set_attribute("output_hash", output_hash)
+            span.set_attribute("streaming", False)
+
+            # Store output based on capture mode
+            if capture_mode == CaptureMode.FULL:
+                output_serialized = _serialize_for_storage(result)
+                if output_serialized:
+                    span.set_attribute("output", output_serialized)
+            elif capture_mode == CaptureMode.EVIDENCE_ONLY:
+                output_serialized = _serialize_for_storage(result, MAX_EVIDENCE_BYTES)
+                if output_serialized:
+                    span.set_attribute("output", output_serialized)
 
             # Extract token usage if available in result
             self._extract_token_usage(span, result)
@@ -406,15 +782,21 @@ class ModelCallDecorator:
             return result
 
         except Exception as e:
+            # Enhanced error context
+            error_context = _format_error_context(e, capture_mode, input_for_hash)
+            span.set_attribute("error_context", error_context)
             span.set_status(SpanStatus.ERROR, str(e))
             run.record_retry()
             raise
 
         finally:
-            span.end()
-            run.add_span(span)
-            if token is not None:
-                reset_current_span(token)
+            # Only finalize span if we didn't return a stream wrapper
+            # (stream wrapper handles its own finalization)
+            if not is_stream_result:
+                span.end()
+                run.add_span(span)
+                if token is not None:
+                    reset_current_span(token)
 
     async def _execute_model_call_async(
         self,
@@ -432,6 +814,7 @@ class ModelCallDecorator:
             return await fn(*args, **kwargs)
 
         observe = run._observe
+        capture_mode = observe.config.mode
 
         # Check policies
         self._check_policies(run, observe)
@@ -442,17 +825,48 @@ class ModelCallDecorator:
         # Set as current span
         token = set_current_span(span)
 
-        try:
-            # Hash input
-            input_for_hash = {"args": args, "kwargs": kwargs}
-            input_hash = hash_json(input_for_hash)
-            span.set_attribute("input_hash", input_hash)
+        # Hash input
+        input_for_hash = {"args": args, "kwargs": kwargs}
+        input_hash = hash_json(input_for_hash)
+        span.set_attribute("input_hash", input_hash)
 
+        # Store input based on capture mode
+        if capture_mode == CaptureMode.FULL:
+            input_serialized = _serialize_for_storage(input_for_hash)
+            if input_serialized:
+                span.set_attribute("input", input_serialized)
+        elif capture_mode == CaptureMode.EVIDENCE_ONLY:
+            input_serialized = _serialize_for_storage(input_for_hash, MAX_EVIDENCE_BYTES)
+            if input_serialized:
+                span.set_attribute("input", input_serialized)
+
+        is_stream_result = False
+        try:
             result = await fn(*args, **kwargs)
 
-            # Hash output
+            # Check if result is an async stream
+            if _is_async_stream(result):
+                is_stream_result = True
+                # For streams, reset the current span context but DON'T end the span
+                # The stream wrapper will handle finalization when exhausted
+                if token is not None:
+                    reset_current_span(token)
+                return AsyncStreamWrapper(result, span, capture_mode, run)
+
+            # Non-streaming: hash and store output
             output_hash = hash_json(result)
             span.set_attribute("output_hash", output_hash)
+            span.set_attribute("streaming", False)
+
+            # Store output based on capture mode
+            if capture_mode == CaptureMode.FULL:
+                output_serialized = _serialize_for_storage(result)
+                if output_serialized:
+                    span.set_attribute("output", output_serialized)
+            elif capture_mode == CaptureMode.EVIDENCE_ONLY:
+                output_serialized = _serialize_for_storage(result, MAX_EVIDENCE_BYTES)
+                if output_serialized:
+                    span.set_attribute("output", output_serialized)
 
             # Extract token usage if available in result
             self._extract_token_usage(span, result)
@@ -461,15 +875,21 @@ class ModelCallDecorator:
             return result
 
         except Exception as e:
+            # Enhanced error context
+            error_context = _format_error_context(e, capture_mode, input_for_hash)
+            span.set_attribute("error_context", error_context)
             span.set_status(SpanStatus.ERROR, str(e))
             run.record_retry()
             raise
 
         finally:
-            span.end()
-            run.add_span(span)
-            if token is not None:
-                reset_current_span(token)
+            # Only finalize span if we didn't return a stream wrapper
+            # (stream wrapper handles its own finalization)
+            if not is_stream_result:
+                span.end()
+                run.add_span(span)
+                if token is not None:
+                    reset_current_span(token)
 
     def _extract_token_usage(self, span: SpanContext, result: Any) -> None:
         """Extract token usage from LLM response if available."""

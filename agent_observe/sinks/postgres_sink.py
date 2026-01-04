@@ -155,6 +155,7 @@ class PostgresSink(Sink):
         self,
         database_url: str,
         async_writes: bool = True,
+        schema: str = "public",
     ):
         """
         Initialize PostgreSQL sink.
@@ -162,9 +163,11 @@ class PostgresSink(Sink):
         Args:
             database_url: PostgreSQL connection string.
             async_writes: If True, writes are queued and flushed in background.
+            schema: PostgreSQL schema name (default: public).
         """
         super().__init__(async_writes=async_writes)
         self.database_url = database_url
+        self.schema = schema
         self._initialized = False
 
     def _get_connection(self) -> Any:
@@ -172,14 +175,18 @@ class PostgresSink(Sink):
         Get a new database connection with timeout.
 
         Uses autocommit=False for explicit transaction control.
+        Sets search_path to the configured schema.
         """
         import psycopg
 
-        return psycopg.connect(
+        conn = psycopg.connect(
             self.database_url,
             connect_timeout=CONNECTION_TIMEOUT_SECONDS,
             autocommit=False,
         )
+        # Set search_path to use the configured schema
+        conn.execute("SET search_path TO %s", (self.schema,))
+        return conn
 
     def _execute_with_retry(
         self,
@@ -245,8 +252,8 @@ class PostgresSink(Sink):
         required_tables = {"runs", "spans", "events"}
         result = conn.execute(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = 'public' AND table_name = ANY(%s)",
-            (list(required_tables),),
+            "WHERE table_schema = %s AND table_name = ANY(%s)",
+            (self.schema, list(required_tables)),
         ).fetchall()
 
         existing_tables = {row[0] for row in result}

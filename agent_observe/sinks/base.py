@@ -420,7 +420,10 @@ def create_sink(config: Config) -> Sink:
 
             if not config.database_url:
                 raise ValueError("DATABASE_URL required for Postgres sink")
-            return PostgresSink(database_url=config.database_url)
+            return PostgresSink(
+                database_url=config.database_url,
+                schema=config.pg_schema,
+            )
 
         elif sink_type == SinkType.OTLP:
             from agent_observe.sinks.otel_sink import OTLPSink

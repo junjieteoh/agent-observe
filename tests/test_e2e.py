@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -516,5 +517,202 @@ class TestEndToEnd:
 
         # Inner span should have outer span as parent
         assert inner_span["parent_span_id"] == outer_span["span_id"]
+
+        obs._cleanup()
+
+    def test_error_context_in_full_mode(self, temp_dir: Path) -> None:
+        """Test that error context includes traceback in full mode."""
+        config = Config(
+            mode=CaptureMode.FULL,
+            env=Environment.DEV,
+            sink_type=SinkType.SQLITE,
+            sqlite_path=temp_dir / "error_context.db",
+        )
+
+        obs = Observe()
+        obs.install(config=config)
+
+        @tool
+        def error_tool(x: int) -> int:
+            if x < 0:
+                raise ValueError("Negative input not allowed")
+            return x * 2
+
+        with pytest.raises(ValueError, match="Negative input"), obs.run("error-agent"):
+            error_tool(-1)
+
+        obs.sink.flush()
+
+        runs = obs.sink.get_runs()
+        spans = obs.sink.get_spans(runs[0]["run_id"])
+        assert len(spans) == 1
+
+        # Error context should be present in full mode
+        error_context = spans[0]["attrs"].get("error_context", {})
+        assert error_context.get("type") == "ValueError"
+        assert "Negative input" in error_context.get("message", "")
+        # Traceback should be present in full mode
+        assert "traceback" in error_context
+        # Input should be stored in full mode
+        assert "input" in error_context
+
+        obs._cleanup()
+
+    def test_error_context_in_metadata_mode(self, temp_dir: Path) -> None:
+        """Test that error context only has basic info in metadata mode."""
+        config = Config(
+            mode=CaptureMode.METADATA_ONLY,
+            env=Environment.DEV,
+            sink_type=SinkType.SQLITE,
+            sqlite_path=temp_dir / "error_metadata.db",
+        )
+
+        obs = Observe()
+        obs.install(config=config)
+
+        @tool
+        def error_tool() -> int:
+            raise RuntimeError("Something went wrong")
+
+        with pytest.raises(RuntimeError), obs.run("error-agent"):
+            error_tool()
+
+        obs.sink.flush()
+
+        runs = obs.sink.get_runs()
+        spans = obs.sink.get_spans(runs[0]["run_id"])
+        assert len(spans) == 1
+
+        # Error context should have basic info but no traceback/input
+        error_context = spans[0]["attrs"].get("error_context", {})
+        assert error_context.get("type") == "RuntimeError"
+        assert "traceback" not in error_context
+        assert "input" not in error_context
+
+        obs._cleanup()
+
+    def test_streaming_model_call(self, temp_dir: Path) -> None:
+        """Test that streaming LLM responses are wrapped and metrics recorded."""
+        from agent_observe.decorators import SyncStreamWrapper
+
+        config = Config(
+            mode=CaptureMode.FULL,
+            env=Environment.DEV,
+            sink_type=SinkType.SQLITE,
+            sqlite_path=temp_dir / "streaming.db",
+        )
+
+        obs = Observe()
+        obs.install(config=config)
+
+        def mock_stream():
+            """Simulate a streaming response."""
+            yield {"delta": {"text": "Hello"}}
+            yield {"delta": {"text": " World"}}
+            yield {"delta": {"text": "!"}}
+
+        @model_call(provider="test", model="streaming-model")
+        def streaming_llm() -> Any:
+            return mock_stream()
+
+        with obs.run("streaming-agent"):
+            stream = streaming_llm()
+            # The result should be a SyncStreamWrapper
+            assert isinstance(stream, SyncStreamWrapper)
+
+            # Consume the stream
+            chunks = list(stream)
+            assert len(chunks) == 3
+
+        obs.sink.flush()
+
+        runs = obs.sink.get_runs()
+        spans = obs.sink.get_spans(runs[0]["run_id"])
+        assert len(spans) == 1
+
+        # Check streaming metrics were recorded
+        attrs = spans[0]["attrs"]
+        assert attrs.get("streaming") is True
+        assert attrs.get("chunk_count") == 3
+        assert "ts_first_token" in attrs
+        assert "ts_last_token" in attrs
+        # Output should be accumulated in full mode
+        assert attrs.get("output") == "Hello World!"
+
+        obs._cleanup()
+
+    def test_streaming_model_call_evidence_mode(self, temp_dir: Path) -> None:
+        """Test streaming in evidence_only mode with size limit."""
+        from agent_observe.decorators import SyncStreamWrapper
+
+        config = Config(
+            mode=CaptureMode.EVIDENCE_ONLY,
+            env=Environment.DEV,
+            sink_type=SinkType.SQLITE,
+            sqlite_path=temp_dir / "streaming_evidence.db",
+        )
+
+        obs = Observe()
+        obs.install(config=config)
+
+        def mock_stream():
+            yield {"delta": {"text": "Short response"}}
+
+        @model_call(provider="test", model="streaming-model")
+        def streaming_llm() -> Any:
+            return mock_stream()
+
+        with obs.run("streaming-agent"):
+            stream = streaming_llm()
+            list(stream)  # Consume
+
+        obs.sink.flush()
+
+        runs = obs.sink.get_runs()
+        spans = obs.sink.get_spans(runs[0]["run_id"])
+
+        # Short output should be stored in evidence mode
+        attrs = spans[0]["attrs"]
+        assert attrs.get("output") == "Short response"
+
+        obs._cleanup()
+
+    def test_streaming_model_call_error(self, temp_dir: Path) -> None:
+        """Test that streaming errors are properly finalized."""
+        from agent_observe.decorators import SyncStreamWrapper
+
+        config = Config(
+            mode=CaptureMode.FULL,
+            env=Environment.DEV,
+            sink_type=SinkType.SQLITE,
+            sqlite_path=temp_dir / "streaming_error.db",
+        )
+
+        obs = Observe()
+        obs.install(config=config)
+
+        def error_stream():
+            yield {"delta": {"text": "Starting..."}}
+            raise RuntimeError("Stream connection lost")
+
+        @model_call(provider="test", model="streaming-model")
+        def streaming_llm() -> Any:
+            return error_stream()
+
+        with pytest.raises(RuntimeError, match="connection lost"), obs.run("streaming-error"):
+            stream = streaming_llm()
+            list(stream)  # Consume until error
+
+        obs.sink.flush()
+
+        runs = obs.sink.get_runs()
+        spans = obs.sink.get_spans(runs[0]["run_id"])
+        assert len(spans) == 1
+
+        # Span should be finalized with error status
+        attrs = spans[0]["attrs"]
+        assert attrs.get("streaming") is True
+        assert attrs.get("chunk_count") == 1  # Got one chunk before error
+        assert spans[0]["status"] == "error"
 
         obs._cleanup()

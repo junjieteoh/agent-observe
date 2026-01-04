@@ -7,13 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2025-01-05
+
+### Added
+- **Capture mode support in decorators**: `@tool` and `@model_call` now respect `capture_mode` setting
+  - `full` mode: stores actual `args`/`result` (tools) and `input`/`output` (model calls)
+  - `evidence_only` mode: stores content up to 64KB limit
+  - `metadata_only` mode: stores only hashes (existing behavior)
+- **pg_schema config**: PostgreSQL schema support - `Config(pg_schema="myschema")` or `AGENT_OBSERVE_PG_SCHEMA` env var (default: public)
+- **Streaming LLM response support**: `@model_call` now detects and wraps streaming responses
+  - Captures Time to First Token (TTFT) via `ts_first_token` attribute
+  - Captures Time to Last Token via `ts_last_token` attribute
+  - Records `chunk_count` for stream length
+  - Accumulates output and stores based on `capture_mode`
+  - Properly finalizes spans on stream errors (not just on exhaustion)
+  - Works with OpenAI, Anthropic, and generic streaming formats
+- **Enhanced error context**: Errors now include structured context based on `capture_mode`
+  - `full` mode: includes error type, message, full traceback, and input that caused the error
+  - `evidence_only` mode: includes error type, message, and truncated traceback (4KB limit)
+  - `metadata_only` mode: includes only error type and message
+
+### Changed
+- Updated AGENTS.md to prefer `Config` object for configuration
+- Error handling in `@tool` and `@model_call` now uses structured error context
+
 ## [0.1.3] - 2025-01-04
 
 ### Added
 - **Examples folder**: Runnable scripts for basic usage, capture modes, policies, async, and querying
 - **Policy roadmap**: Documented planned enhancements (argument-level policies, conditional policies, etc.)
-
-*No schema changes - safe upgrade from v0.1.2*
 
 ## [0.1.2] - 2025-01-04
 
@@ -74,7 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite
 - Example agents demonstrating usage
 
-[Unreleased]: https://github.com/junjieteoh/agent-observe/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/junjieteoh/agent-observe/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/junjieteoh/agent-observe/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/junjieteoh/agent-observe/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/junjieteoh/agent-observe/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/junjieteoh/agent-observe/compare/v0.1.0...v0.1.1

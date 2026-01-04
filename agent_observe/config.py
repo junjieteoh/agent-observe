@@ -120,6 +120,7 @@ class Config:
     jsonl_dir: Path = field(default_factory=lambda: Path(".riff/traces/"))
     database_url: str | None = None
     otlp_endpoint: str | None = None
+    pg_schema: str = "public"  # PostgreSQL schema name
 
     # Policy settings
     policy_file: Path | None = None
@@ -254,6 +255,7 @@ def load_config() -> Config:
         AGENT_OBSERVE_SQLITE_PATH: SQLite database path (default: .riff/observe.db)
         AGENT_OBSERVE_JSONL_DIR: JSONL output directory (default: .riff/traces/)
         DATABASE_URL: Postgres connection string (enables postgres sink)
+        AGENT_OBSERVE_PG_SCHEMA: PostgreSQL schema name (default: public)
         OTEL_EXPORTER_OTLP_ENDPOINT: OTLP endpoint (enables otlp sink)
         AGENT_OBSERVE_POLICY_FILE: Path to policy YAML file
         AGENT_OBSERVE_FAIL_ON_VIOLATION: 0|1 (default: 0)
@@ -303,6 +305,7 @@ def load_config() -> Config:
     # Get connection strings
     database_url = os.environ.get("DATABASE_URL")
     otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+    pg_schema = os.environ.get("AGENT_OBSERVE_PG_SCHEMA", "public")
 
     # Get project and version
     project = os.environ.get("AGENT_OBSERVE_PROJECT") or _infer_project()
@@ -318,6 +321,7 @@ def load_config() -> Config:
         jsonl_dir=jsonl_dir,
         database_url=database_url,
         otlp_endpoint=otlp_endpoint,
+        pg_schema=pg_schema,
         policy_file=policy_file,
         fail_on_violation=_get_env_bool("AGENT_OBSERVE_FAIL_ON_VIOLATION", False),
         replay_mode=replay_mode,
