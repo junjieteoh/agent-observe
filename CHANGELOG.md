@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2025-01-04
+
+### Fixed
+- **PostgreSQL executemany bug**: Fixed `cursor.executemany()` call (was incorrectly called on connection object)
+
+### Added
+- **GIN index on eval_tags**: Fast JSONB containment queries for tag filtering
+- **Partial index on parent_span_id**: Efficient hierarchical span lookups
+- **Index on replay_cache.created_ts**: Enables TTL-based cache cleanup
+- **CHECK constraint on risk_score**: Database-level validation (0-100 range)
+
+### Changed
+- PostgreSQL dependency will use `psycopg[binary]` to include precompiled binaries (fixes "libpq not found" errors)
+- Updated AGENTS.md with schema design notes and rationale
+
 ## [0.1.1] - 2025-01-04
 
 ### Fixed
@@ -22,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Unit tests for PostgreSQL sink**: New tests that don't require a real database
 
 ### Changed
-- Simplified PostgreSQL dependency from `psycopg[pool]` to just `psycopg`
+- PostgreSQL dependency now uses `psycopg[binary]` to include precompiled binaries (fixes "no libpq" errors)
 - Improved documentation with PostgreSQL best practices and manual schema SQL
 
 ## [0.1.0] - 2025-01-04
@@ -48,6 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite
 - Example agents demonstrating usage
 
-[Unreleased]: https://github.com/junjieteoh/agent-observe/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/junjieteoh/agent-observe/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/junjieteoh/agent-observe/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/junjieteoh/agent-observe/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/junjieteoh/agent-observe/releases/tag/v0.1.0

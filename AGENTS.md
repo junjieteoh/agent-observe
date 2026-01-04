@@ -724,6 +724,8 @@ pip install "agent-observe[postgres]"
 pip install "psycopg>=3.1.0"
 ```
 
+> **Note:** If you get "libpq not found" errors, install `psycopg[binary]` instead: `pip install "psycopg[binary]>=3.1.0"`
+
 #### Production Best Practices
 
 The PostgreSQL sink is designed for production use:
@@ -760,7 +762,7 @@ CREATE TABLE IF NOT EXISTS runs (
     project TEXT,
     env TEXT,
     status TEXT CHECK (status IN ('ok', 'error', 'blocked')),
-    risk_score INTEGER,
+    risk_score INTEGER CHECK (risk_score >= 0 AND risk_score <= 100),
     eval_tags JSONB,
     policy_violations INTEGER DEFAULT 0,
     tool_calls INTEGER DEFAULT 0,
@@ -774,6 +776,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_name ON runs(name);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_risk_score ON runs(risk_score);
 CREATE INDEX IF NOT EXISTS idx_runs_project_env ON runs(project, env);
+CREATE INDEX IF NOT EXISTS idx_runs_eval_tags ON runs USING GIN(eval_tags);
 
 -- Spans table (span_id is TEXT for OpenTelemetry compatibility)
 CREATE TABLE IF NOT EXISTS spans (
@@ -791,6 +794,7 @@ CREATE TABLE IF NOT EXISTS spans (
 );
 
 CREATE INDEX IF NOT EXISTS idx_spans_run_id ON spans(run_id);
+CREATE INDEX IF NOT EXISTS idx_spans_parent ON spans(parent_span_id) WHERE parent_span_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_spans_kind_name ON spans(kind, name);
 CREATE INDEX IF NOT EXISTS idx_spans_ts_start ON spans(ts_start);
 
@@ -820,10 +824,25 @@ CREATE TABLE IF NOT EXISTS replay_cache (
 );
 
 CREATE INDEX IF NOT EXISTS idx_replay_tool_args ON replay_cache(tool_name, args_hash);
+CREATE INDEX IF NOT EXISTS idx_replay_created ON replay_cache(created_ts);
 
 -- Insert schema version
 INSERT INTO agent_observe_schema_version (version) VALUES (1);
 ```
+
+#### Schema Design Notes
+
+| Design Choice | Rationale |
+|---------------|-----------|
+| `run_id UUID` | Globally unique across distributed systems |
+| `span_id TEXT` | OpenTelemetry uses 16-char hex IDs, not UUIDs |
+| `TIMESTAMPTZ` | Timezone-aware, avoids ambiguity |
+| `JSONB` for attrs/tags | Flexible schema for varying tool attributes |
+| `ON DELETE CASCADE` | Automatic cleanup when runs are deleted |
+| `GIN index on eval_tags` | Fast JSONB containment queries (`@>`) |
+| `Partial index on parent_span_id` | Only indexes non-null values (efficient) |
+| `idx_replay_created` | Enables efficient TTL-based cleanup |
+| `risk_score CHECK 0-100` | Validates range at database level |
 
 ---
 

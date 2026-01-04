@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS runs (
     project TEXT,
     env TEXT,
     status TEXT CHECK (status IN ('ok', 'error', 'blocked')),
-    risk_score INTEGER,
+    risk_score INTEGER CHECK (risk_score >= 0 AND risk_score <= 100),
     eval_tags JSONB,
     policy_violations INTEGER DEFAULT 0,
     tool_calls INTEGER DEFAULT 0,
@@ -87,6 +87,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_name ON runs(name);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_risk_score ON runs(risk_score);
 CREATE INDEX IF NOT EXISTS idx_runs_project_env ON runs(project, env);
+CREATE INDEX IF NOT EXISTS idx_runs_eval_tags ON runs USING GIN(eval_tags);
 
 -- Spans table
 CREATE TABLE IF NOT EXISTS spans (
@@ -104,6 +105,7 @@ CREATE TABLE IF NOT EXISTS spans (
 );
 
 CREATE INDEX IF NOT EXISTS idx_spans_run_id ON spans(run_id);
+CREATE INDEX IF NOT EXISTS idx_spans_parent ON spans(parent_span_id) WHERE parent_span_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_spans_kind_name ON spans(kind, name);
 CREATE INDEX IF NOT EXISTS idx_spans_ts_start ON spans(ts_start);
 
@@ -133,6 +135,7 @@ CREATE TABLE IF NOT EXISTS replay_cache (
 );
 
 CREATE INDEX IF NOT EXISTS idx_replay_tool_args ON replay_cache(tool_name, args_hash);
+CREATE INDEX IF NOT EXISTS idx_replay_created ON replay_cache(created_ts);
 """
 
 
@@ -316,54 +319,55 @@ class PostgresSink(Sink):
         def _write() -> None:
             with self._get_connection() as conn:
                 try:
-                    # Prepare batch data
-                    params_list = [
-                        (
-                            run.get("run_id"),
-                            run.get("trace_id"),
-                            run.get("name"),
-                            self._ms_to_datetime(run.get("ts_start")),
-                            self._ms_to_datetime(run.get("ts_end")),
-                            json.dumps(run.get("task")) if run.get("task") else None,
-                            run.get("agent_version"),
-                            run.get("project"),
-                            run.get("env"),
-                            run.get("status"),
-                            run.get("risk_score"),
-                            json.dumps(run.get("eval_tags")) if run.get("eval_tags") else None,
-                            run.get("policy_violations", 0),
-                            run.get("tool_calls", 0),
-                            run.get("model_calls", 0),
-                            run.get("latency_ms"),
-                        )
-                        for run in runs
-                    ]
+                    with conn.cursor() as cur:
+                        # Prepare batch data
+                        params_list = [
+                            (
+                                run.get("run_id"),
+                                run.get("trace_id"),
+                                run.get("name"),
+                                self._ms_to_datetime(run.get("ts_start")),
+                                self._ms_to_datetime(run.get("ts_end")),
+                                json.dumps(run.get("task")) if run.get("task") else None,
+                                run.get("agent_version"),
+                                run.get("project"),
+                                run.get("env"),
+                                run.get("status"),
+                                run.get("risk_score"),
+                                json.dumps(run.get("eval_tags")) if run.get("eval_tags") else None,
+                                run.get("policy_violations", 0),
+                                run.get("tool_calls", 0),
+                                run.get("model_calls", 0),
+                                run.get("latency_ms"),
+                            )
+                            for run in runs
+                        ]
 
-                    conn.executemany(
-                        """
-                        INSERT INTO runs (
-                            run_id, trace_id, name, ts_start, ts_end, task,
-                            agent_version, project, env, status,
-                            risk_score, eval_tags, policy_violations,
-                            tool_calls, model_calls, latency_ms
-                        ) VALUES (
-                            %s::uuid, %s, %s, %s, %s, %s::jsonb,
-                            %s, %s, %s, %s,
-                            %s, %s::jsonb, %s,
-                            %s, %s, %s
+                        cur.executemany(
+                            """
+                            INSERT INTO runs (
+                                run_id, trace_id, name, ts_start, ts_end, task,
+                                agent_version, project, env, status,
+                                risk_score, eval_tags, policy_violations,
+                                tool_calls, model_calls, latency_ms
+                            ) VALUES (
+                                %s::uuid, %s, %s, %s, %s, %s::jsonb,
+                                %s, %s, %s, %s,
+                                %s, %s::jsonb, %s,
+                                %s, %s, %s
+                            )
+                            ON CONFLICT (run_id) DO UPDATE SET
+                                ts_end = EXCLUDED.ts_end,
+                                status = EXCLUDED.status,
+                                risk_score = EXCLUDED.risk_score,
+                                eval_tags = EXCLUDED.eval_tags,
+                                policy_violations = EXCLUDED.policy_violations,
+                                tool_calls = EXCLUDED.tool_calls,
+                                model_calls = EXCLUDED.model_calls,
+                                latency_ms = EXCLUDED.latency_ms
+                            """,
+                            params_list,
                         )
-                        ON CONFLICT (run_id) DO UPDATE SET
-                            ts_end = EXCLUDED.ts_end,
-                            status = EXCLUDED.status,
-                            risk_score = EXCLUDED.risk_score,
-                            eval_tags = EXCLUDED.eval_tags,
-                            policy_violations = EXCLUDED.policy_violations,
-                            tool_calls = EXCLUDED.tool_calls,
-                            model_calls = EXCLUDED.model_calls,
-                            latency_ms = EXCLUDED.latency_ms
-                        """,
-                        params_list,
-                    )
                     conn.commit()
                 except Exception:
                     conn.rollback()
@@ -379,39 +383,40 @@ class PostgresSink(Sink):
         def _write() -> None:
             with self._get_connection() as conn:
                 try:
-                    params_list = [
-                        (
-                            span.get("span_id"),
-                            span.get("run_id"),
-                            span.get("parent_span_id"),
-                            span.get("kind"),
-                            span.get("name"),
-                            self._ms_to_datetime(span.get("ts_start")),
-                            self._ms_to_datetime(span.get("ts_end")),
-                            span.get("status"),
-                            json.dumps(span.get("attrs")) if span.get("attrs") else None,
-                            span.get("error_message"),
-                        )
-                        for span in spans
-                    ]
+                    with conn.cursor() as cur:
+                        params_list = [
+                            (
+                                span.get("span_id"),
+                                span.get("run_id"),
+                                span.get("parent_span_id"),
+                                span.get("kind"),
+                                span.get("name"),
+                                self._ms_to_datetime(span.get("ts_start")),
+                                self._ms_to_datetime(span.get("ts_end")),
+                                span.get("status"),
+                                json.dumps(span.get("attrs")) if span.get("attrs") else None,
+                                span.get("error_message"),
+                            )
+                            for span in spans
+                        ]
 
-                    conn.executemany(
-                        """
-                        INSERT INTO spans (
-                            span_id, run_id, parent_span_id, kind, name,
-                            ts_start, ts_end, status, attrs, error_message
-                        ) VALUES (
-                            %s, %s::uuid, %s, %s, %s,
-                            %s, %s, %s, %s::jsonb, %s
+                        cur.executemany(
+                            """
+                            INSERT INTO spans (
+                                span_id, run_id, parent_span_id, kind, name,
+                                ts_start, ts_end, status, attrs, error_message
+                            ) VALUES (
+                                %s, %s::uuid, %s, %s, %s,
+                                %s, %s, %s, %s::jsonb, %s
+                            )
+                            ON CONFLICT (span_id) DO UPDATE SET
+                                ts_end = EXCLUDED.ts_end,
+                                status = EXCLUDED.status,
+                                attrs = EXCLUDED.attrs,
+                                error_message = EXCLUDED.error_message
+                            """,
+                            params_list,
                         )
-                        ON CONFLICT (span_id) DO UPDATE SET
-                            ts_end = EXCLUDED.ts_end,
-                            status = EXCLUDED.status,
-                            attrs = EXCLUDED.attrs,
-                            error_message = EXCLUDED.error_message
-                        """,
-                        params_list,
-                    )
                     conn.commit()
                 except Exception:
                     conn.rollback()
@@ -427,28 +432,29 @@ class PostgresSink(Sink):
         def _write() -> None:
             with self._get_connection() as conn:
                 try:
-                    params_list = [
-                        (
-                            event.get("event_id"),
-                            event.get("run_id"),
-                            self._ms_to_datetime(event.get("ts")),
-                            event.get("type"),
-                            json.dumps(event.get("payload")) if event.get("payload") else None,
-                        )
-                        for event in events
-                    ]
+                    with conn.cursor() as cur:
+                        params_list = [
+                            (
+                                event.get("event_id"),
+                                event.get("run_id"),
+                                self._ms_to_datetime(event.get("ts")),
+                                event.get("type"),
+                                json.dumps(event.get("payload")) if event.get("payload") else None,
+                            )
+                            for event in events
+                        ]
 
-                    conn.executemany(
-                        """
-                        INSERT INTO events (
-                            event_id, run_id, ts, type, payload
-                        ) VALUES (
-                            %s::uuid, %s::uuid, %s, %s, %s::jsonb
+                        cur.executemany(
+                            """
+                            INSERT INTO events (
+                                event_id, run_id, ts, type, payload
+                            ) VALUES (
+                                %s::uuid, %s::uuid, %s, %s, %s::jsonb
+                            )
+                            ON CONFLICT (event_id) DO NOTHING
+                            """,
+                            params_list,
                         )
-                        ON CONFLICT (event_id) DO NOTHING
-                        """,
-                        params_list,
-                    )
                     conn.commit()
                 except Exception:
                     conn.rollback()
@@ -464,38 +470,39 @@ class PostgresSink(Sink):
         def _write() -> None:
             with self._get_connection() as conn:
                 try:
-                    params_list = []
-                    for entry in entries:
-                        result = entry.get("result")
-                        if result is not None and not isinstance(result, bytes):
-                            result = json.dumps(result).encode("utf-8")
+                    with conn.cursor() as cur:
+                        params_list = []
+                        for entry in entries:
+                            result = entry.get("result")
+                            if result is not None and not isinstance(result, bytes):
+                                result = json.dumps(result).encode("utf-8")
 
-                        params_list.append(
-                            (
-                                entry.get("key"),
-                                entry.get("tool_name"),
-                                entry.get("args_hash"),
-                                entry.get("tool_version"),
-                                self._ms_to_datetime(entry.get("created_ts")),
-                                entry.get("status"),
-                                result,
-                                entry.get("result_hash"),
+                            params_list.append(
+                                (
+                                    entry.get("key"),
+                                    entry.get("tool_name"),
+                                    entry.get("args_hash"),
+                                    entry.get("tool_version"),
+                                    self._ms_to_datetime(entry.get("created_ts")),
+                                    entry.get("status"),
+                                    result,
+                                    entry.get("result_hash"),
+                                )
                             )
-                        )
 
-                    conn.executemany(
-                        """
-                        INSERT INTO replay_cache (
-                            key, tool_name, args_hash, tool_version,
-                            created_ts, status, result, result_hash
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (key) DO UPDATE SET
-                            status = EXCLUDED.status,
-                            result = EXCLUDED.result,
-                            result_hash = EXCLUDED.result_hash
-                        """,
-                        params_list,
-                    )
+                        cur.executemany(
+                            """
+                            INSERT INTO replay_cache (
+                                key, tool_name, args_hash, tool_version,
+                                created_ts, status, result, result_hash
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (key) DO UPDATE SET
+                                status = EXCLUDED.status,
+                                result = EXCLUDED.result,
+                                result_hash = EXCLUDED.result_hash
+                            """,
+                            params_list,
+                        )
                     conn.commit()
                 except Exception:
                     conn.rollback()

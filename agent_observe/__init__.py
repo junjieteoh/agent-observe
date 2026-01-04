@@ -38,4 +38,4 @@ try:
 
     __version__ = _get_version("agent-observe")
 except Exception:
-    __version__ = "0.1.1"  # Fallback for development
+    __version__ = "0.1.2"  # Fallback for development

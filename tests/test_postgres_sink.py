@@ -86,9 +86,14 @@ class TestPostgresSinkUnit:
         sink = PostgresSink(database_url="postgresql://test", async_writes=False)
         sink._initialized = True
 
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+
         mock_conn = MagicMock()
         mock_conn.__enter__ = MagicMock(return_value=mock_conn)
         mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value = mock_cursor
 
         with patch.object(sink, "_get_connection", return_value=mock_conn):
             # Write a span with 16-char span_id (OpenTelemetry format)
@@ -104,9 +109,9 @@ class TestPostgresSinkUnit:
                 "attrs": {},
             }])
 
-        # Check that executemany was called (batch insert)
-        mock_conn.executemany.assert_called()
-        call_args = mock_conn.executemany.call_args
+        # Check that executemany was called on the cursor (batch insert)
+        mock_cursor.executemany.assert_called()
+        call_args = mock_cursor.executemany.call_args
         sql = call_args[0][0]
 
         # The span_id should NOT be cast to uuid
