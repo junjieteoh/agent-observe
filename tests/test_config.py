@@ -69,6 +69,42 @@ class TestConfig:
         )
         assert config.resolve_sink_type() == SinkType.JSONL
 
+    def test_config_accepts_strings(self) -> None:
+        """Test that Config accepts string values and converts to enums."""
+        config = Config(
+            mode="full",
+            env="dev",
+            sink_type="postgres",
+            replay_mode="write",
+        )
+
+        assert config.mode == CaptureMode.FULL
+        assert config.env == Environment.DEV
+        assert config.sink_type == SinkType.POSTGRES
+        assert config.replay_mode == ReplayMode.WRITE
+
+    def test_config_accepts_mixed_strings_and_enums(self) -> None:
+        """Test that Config accepts mix of strings and enums."""
+        config = Config(
+            mode=CaptureMode.EVIDENCE_ONLY,
+            env="staging",
+            sink_type=SinkType.SQLITE,
+        )
+
+        assert config.mode == CaptureMode.EVIDENCE_ONLY
+        assert config.env == Environment.STAGING
+        assert config.sink_type == SinkType.SQLITE
+
+    def test_config_invalid_string_uses_default(self) -> None:
+        """Test that invalid string values fall back to defaults."""
+        config = Config(
+            mode="invalid_mode",
+            env="invalid_env",
+        )
+
+        assert config.mode == CaptureMode.METADATA_ONLY
+        assert config.env == Environment.PROD
+
 
 class TestLoadConfig:
     """Tests for load_config function."""

@@ -52,9 +52,61 @@ class ReplayMode(Enum):
     READ = "read"
 
 
-@dataclass(frozen=True)
+def _to_capture_mode(value: CaptureMode | str) -> CaptureMode:
+    """Convert string or enum to CaptureMode."""
+    if isinstance(value, CaptureMode):
+        return value
+    if isinstance(value, str):
+        try:
+            return CaptureMode(value.lower())
+        except ValueError:
+            logger.warning(f"Invalid capture mode '{value}', using metadata_only")
+            return CaptureMode.METADATA_ONLY
+    return CaptureMode.METADATA_ONLY
+
+
+def _to_environment(value: Environment | str) -> Environment:
+    """Convert string or enum to Environment."""
+    if isinstance(value, Environment):
+        return value
+    if isinstance(value, str):
+        try:
+            return Environment(value.lower())
+        except ValueError:
+            logger.warning(f"Invalid environment '{value}', using prod")
+            return Environment.PROD
+    return Environment.PROD
+
+
+def _to_sink_type(value: SinkType | str) -> SinkType:
+    """Convert string or enum to SinkType."""
+    if isinstance(value, SinkType):
+        return value
+    if isinstance(value, str):
+        try:
+            return SinkType(value.lower())
+        except ValueError:
+            logger.warning(f"Invalid sink type '{value}', using auto")
+            return SinkType.AUTO
+    return SinkType.AUTO
+
+
+def _to_replay_mode(value: ReplayMode | str) -> ReplayMode:
+    """Convert string or enum to ReplayMode."""
+    if isinstance(value, ReplayMode):
+        return value
+    if isinstance(value, str):
+        try:
+            return ReplayMode(value.lower())
+        except ValueError:
+            logger.warning(f"Invalid replay mode '{value}', using off")
+            return ReplayMode.OFF
+    return ReplayMode.OFF
+
+
+@dataclass
 class Config:
-    """Immutable configuration for agent-observe."""
+    """Configuration for agent-observe. Accepts strings or enums for mode/env/sink."""
 
     # Core settings
     mode: CaptureMode = CaptureMode.METADATA_ONLY
@@ -83,6 +135,14 @@ class Config:
     # Size caps
     max_event_payload_bytes: int = 16 * 1024  # 16KB
     max_artifact_bytes: int = 64 * 1024  # 64KB
+
+    def __post_init__(self) -> None:
+        """Convert string values to enums."""
+        # Use object.__setattr__ since we want to normalize values
+        object.__setattr__(self, "mode", _to_capture_mode(self.mode))
+        object.__setattr__(self, "env", _to_environment(self.env))
+        object.__setattr__(self, "sink_type", _to_sink_type(self.sink_type))
+        object.__setattr__(self, "replay_mode", _to_replay_mode(self.replay_mode))
 
     def resolve_sink_type(self) -> SinkType:
         """

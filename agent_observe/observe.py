@@ -293,6 +293,7 @@ class Observe:
             run_data["risk_score"] = eval_result.risk_score
             run_data["eval_tags"] = eval_result.eval_tags
             run_data["latency_ms"] = run_ctx.duration_ms
+            run_data["capture_mode"] = self.config.mode.value
 
             # Write run to sink
             self.sink.write_run(run_data)
@@ -390,6 +391,7 @@ class Observe:
             run_data["risk_score"] = eval_result.risk_score
             run_data["eval_tags"] = eval_result.eval_tags
             run_data["latency_ms"] = run_ctx.duration_ms
+            run_data["capture_mode"] = self.config.mode.value
 
             # Write run to sink
             self.sink.write_run(run_data)

@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS runs (
     agent_version TEXT,
     project TEXT,
     env TEXT,
+    capture_mode TEXT CHECK (capture_mode IN ('off', 'metadata_only', 'evidence_only', 'full')),
     status TEXT CHECK (status IN ('ok', 'error', 'blocked')),
     risk_score INTEGER CHECK (risk_score >= 0 AND risk_score <= 100),
     eval_tags JSONB,
@@ -332,6 +333,7 @@ class PostgresSink(Sink):
                                 run.get("agent_version"),
                                 run.get("project"),
                                 run.get("env"),
+                                run.get("capture_mode"),
                                 run.get("status"),
                                 run.get("risk_score"),
                                 json.dumps(run.get("eval_tags")) if run.get("eval_tags") else None,
@@ -347,12 +349,12 @@ class PostgresSink(Sink):
                             """
                             INSERT INTO runs (
                                 run_id, trace_id, name, ts_start, ts_end, task,
-                                agent_version, project, env, status,
+                                agent_version, project, env, capture_mode, status,
                                 risk_score, eval_tags, policy_violations,
                                 tool_calls, model_calls, latency_ms
                             ) VALUES (
                                 %s::uuid, %s, %s, %s, %s, %s::jsonb,
-                                %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s,
                                 %s, %s::jsonb, %s,
                                 %s, %s, %s
                             )

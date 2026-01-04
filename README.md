@@ -5,32 +5,27 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Overview
+## What is this?
 
-`agent-observe` is a lightweight runtime layer that provides:
+`agent-observe` is a lightweight runtime layer that wraps your AI agent code to capture:
 
-- **Observability** - Track agent runs, tool calls, and model invocations
-- **Audit/Compliance** - Policy engine with deny/allow patterns for tools
-- **Label-free Eval** - Automatic risk scoring based on behavioral signals
-- **Tool Replay** - Cache tool results for deterministic testing
-- **Local Viewer** - FastAPI UI for browsing and debugging runs
+- **What tools were called** and when
+- **What LLM calls were made** and how long they took
+- **Policy violations** (blocked operations)
+- **Risk scores** based on behavioral signals
 
 Designed to be **enterprise-safe by default** - stores only metadata (hashes, sizes, timings), not raw content.
 
 ## Installation
 
 ```bash
-# Core package
 pip install agent-observe
-
-# With viewer UI
-pip install agent-observe[viewer]
 
 # With PostgreSQL support
 pip install agent-observe[postgres]
 
-# All extras
-pip install agent-observe[all]
+# With viewer UI
+pip install agent-observe[viewer]
 ```
 
 ## Quick Start
@@ -38,81 +33,130 @@ pip install agent-observe[all]
 ```python
 from agent_observe import observe, tool, model_call
 
-# Initialize (zero-config, auto-detects environment)
+# Initialize (zero-config)
 observe.install()
 
-# Define tools
+# Wrap your tools
 @tool(name="search", kind="http")
-def search_web(query: str) -> list[dict]:
-    # Your implementation
-    return [{"title": "Result", "url": "https://..."}]
+def search_web(query: str) -> list:
+    return requests.get(f"https://api.search.com?q={query}").json()
 
+# Wrap your LLM calls
 @model_call(provider="openai", model="gpt-4")
 def call_llm(prompt: str) -> str:
-    # Your LLM call
-    return "Response..."
+    return openai.chat.completions.create(...).choices[0].message.content
 
 # Run your agent
-with observe.run("my-agent", task={"goal": "Research topic"}):
+with observe.run("my-agent", task={"goal": "Research AI"}):
     results = search_web("AI agents")
     analysis = call_llm(f"Analyze: {results}")
-    observe.emit_artifact("analysis", analysis)
 ```
 
-View the results:
-
+View results:
 ```bash
 agent-observe view
+# Open http://localhost:8765
 ```
 
-### Async Support
+## Documentation
 
-Full async/await support for modern agent frameworks:
+| Document | Description |
+|----------|-------------|
+| **[Examples](examples/)** | Runnable code examples (basic usage, async, policies) |
+| **[Data Model](docs/DATA_MODEL.md)** | What are Runs, Spans, Events, and Replay Cache? |
+| **[Capture Modes](docs/CAPTURE_MODES.md)** | What data is stored? Hashes vs full content |
+| **[Configuration](docs/CONFIGURATION.md)** | Environment variables and Config options |
+| **[Usage Guide](docs/USAGE_GUIDE.md)** | Policies, risk scoring, querying, real-world examples |
+| **[Integration Guide](AGENTS.md)** | How to integrate with OpenAI, Anthropic, LangChain, etc. |
+
+## Key Concepts
+
+### Runs, Spans, and Events
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        observe.run()                         │
+│                           (Run)                              │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
+│  │ @tool       │  │ @model_call │  │ emit_event  │          │
+│  │  (Span)     │  │   (Span)    │  │  (Event)    │          │
+│  └─────────────┘  └─────────────┘  └─────────────┘          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+- **Run** = One agent execution (start to finish)
+- **Span** = One tool or model call within a run
+- **Event** = Custom occurrence you emit
+
+See [Data Model](docs/DATA_MODEL.md) for details.
+
+### Capture Modes
+
+| Mode | What's Stored | Use Case |
+|------|---------------|----------|
+| `metadata_only` | Hashes, timings | Production (default) |
+| `evidence_only` | Small content + hashes | Debugging |
+| `full` | Everything | Development |
+
+**Default is `metadata_only`** - enterprise-safe, no PII leakage.
+
+See [Capture Modes](docs/CAPTURE_MODES.md) for details.
+
+### Risk Scoring
+
+Automatic risk scoring (0-100) based on:
+
+| Signal | Weight |
+|--------|--------|
+| Policy violations | +40 |
+| Tool success rate < 90% | +25 |
+| Repeated tool calls (loops) | +15 |
+| 5+ retries | +10 |
+| Latency exceeds budget | +10 |
+
+## Configuration
+
+### Zero-Config (Recommended)
 
 ```python
-@tool(name="fetch_data", kind="http")
-async def fetch_data(url: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        return await client.get(url)
-
-@model_call(provider="anthropic", model="claude-3")
-async def call_claude(prompt: str) -> str:
-    return await anthropic.messages.create(...)
-
-# Use async context manager
-async with observe.arun("async-agent"):
-    data = await fetch_data("https://api.example.com")
-    response = await call_claude(f"Analyze: {data}")
+observe.install()  # Reads from environment variables
 ```
 
-## Framework Integration
+### Environment Variables
 
-See **[AGENTS.md](AGENTS.md)** for detailed integration examples with:
-- OpenAI Function Calling
-- Anthropic Claude
-- Google Vertex AI / Gemini
-- LangChain
-- Custom ReAct agents
+```bash
+AGENT_OBSERVE_MODE=metadata_only    # Capture mode
+AGENT_OBSERVE_ENV=prod              # Environment
+DATABASE_URL=postgresql://...       # Enables Postgres sink
+```
 
-## Features
+See [Configuration](docs/CONFIGURATION.md) for all options.
 
-### Zero-Config Defaults
+### Explicit Config
 
-Just call `observe.install()` - it automatically:
-- Selects the right sink based on environment
-- Uses SQLite for local dev, Postgres if `DATABASE_URL` is set
-- Captures metadata only (enterprise-safe)
+```python
+from agent_observe.config import Config, CaptureMode, SinkType
 
-### Automatic Sink Selection
+config = Config(
+    mode=CaptureMode.FULL,
+    sink_type=SinkType.POSTGRES,
+    database_url=os.environ.get("DATABASE_URL"),
+)
+observe.install(config=config)
+```
 
-| Condition | Sink |
-|-----------|------|
-| `DATABASE_URL` set | PostgreSQL |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` set | OTLP (OpenTelemetry) |
-| `AGENT_OBSERVE_ENV=dev` | SQLite |
-| Default | JSONL |
+## Sinks (Storage Backends)
 
-### Policy Engine
+| Sink | Use Case |
+|------|----------|
+| SQLite | Local development |
+| PostgreSQL | Production |
+| JSONL | Simple fallback |
+| OTLP | OpenTelemetry export (Jaeger, Honeycomb, Datadog) |
+
+Auto-selected based on available connections.
+
+## Policy Engine
 
 Create `.riff/observe.policy.yml`:
 
@@ -127,191 +171,40 @@ tools:
 
 limits:
   max_tool_calls: 100
-  max_retries: 10
   max_model_calls: 50
-```
-
-> **Coming Soon:** SQL query validation and network domain restrictions are planned for a future release.
-
-### Risk Scoring
-
-Automatic risk scoring (0-100) based on:
-
-| Signal | Weight | Tag |
-|--------|--------|-----|
-| Policy violations | +40 | `POLICY_VIOLATION` |
-| Tool success rate < 90% | +25 | `TOOL_FAILURE` |
-| Repeated tool calls (loops) | +15 | `LOOP_SUSPECTED` |
-| 5+ retries | +10 | `RETRY_STORM` |
-| Latency exceeds budget | +10 | `LATENCY_BREACH` |
-
-### Capture Modes
-
-| Mode | Description |
-|------|-------------|
-| `off` | Disable observability |
-| `metadata_only` | Store hashes, sizes, timings only (default) |
-| `evidence_only` | Store small blobs with redaction |
-| `full` | Store all content (with caps) |
-
-## Environment Variables
-
-```bash
-# Core
-AGENT_OBSERVE_MODE=metadata_only    # off|metadata_only|evidence_only|full
-AGENT_OBSERVE_ENV=prod              # dev|staging|prod
-AGENT_OBSERVE_PROJECT=my-app        # Project name
-AGENT_OBSERVE_AGENT_VERSION=1.0.0   # Agent version
-
-# Sink selection
-AGENT_OBSERVE_SINK=auto             # auto|sqlite|jsonl|postgres|otlp
-DATABASE_URL=postgresql://...     # Enables Postgres sink
-
-# Policy
-AGENT_OBSERVE_POLICY_FILE=.riff/observe.policy.yml
-AGENT_OBSERVE_FAIL_ON_VIOLATION=0   # 1 to raise on violations
-
-# Replay
-AGENT_OBSERVE_REPLAY=off            # off|write|read
-
-# Performance
-AGENT_OBSERVE_LATENCY_BUDGET_MS=20000
 ```
 
 ## CLI
 
 ```bash
-# Start the viewer
+# Start viewer
 agent-observe view
-agent-observe view --port 8080
 
 # Export to JSONL
 agent-observe export-jsonl -o ./export
-
-# With specific database
-agent-observe view --db .riff/observe.db
-agent-observe view --database-url postgresql://...
-```
-
-## API Reference
-
-### Core
-
-```python
-from agent_observe import observe
-
-# Initialize (reads from environment variables automatically)
-observe.install()
-
-# Or with mode override
-observe.install(mode="metadata_only")
-
-# Create a run context
-with observe.run("agent-name", task={"goal": "..."}) as run:
-    pass
-
-# Emit events
-observe.emit_event("custom.event", {"key": "value"})
-
-# Emit artifacts
-observe.emit_artifact("report", {"data": "..."}, provenance=["tool1", "tool2"])
-```
-
-### Explicit Configuration
-
-When you need full control, pass a `Config` object. **Important:** You must include
-all connection strings explicitly - they are NOT read from environment variables
-when using a custom Config:
-
-```python
-import os
-from agent_observe import observe
-from agent_observe.config import Config, CaptureMode, Environment, SinkType
-
-# Option 1: Let the library auto-detect from env vars (recommended)
-observe.install()
-
-# Option 2: Explicit config - must include ALL required fields
-database_url = os.environ.get("DATABASE_URL")
-
-config = Config(
-    mode=CaptureMode.METADATA_ONLY,
-    env=Environment.PROD,
-    sink_type=SinkType.POSTGRES,
-    project="my-agent",
-    database_url=database_url,  # Required for Postgres!
-)
-observe.install(config=config)
-```
-
-### Decorators
-
-```python
-from agent_observe import tool, model_call
-
-@tool(name="my_tool", kind="db", version="1")
-def my_tool(arg: str) -> dict:
-    pass
-
-@model_call(provider="openai", model="gpt-4")
-def call_model(prompt: str) -> str:
-    pass
 ```
 
 ## Architecture
 
 ```
 agent_observe/
-├── observe.py      # Core runtime (install, run, emit_*)
-├── decorators.py   # @tool, @model_call (sync and async)
+├── observe.py      # Core runtime
+├── decorators.py   # @tool, @model_call
 ├── policy.py       # YAML policy engine
-├── metrics.py      # Risk scoring and eval
+├── metrics.py      # Risk scoring
 ├── replay.py       # Tool result caching
-├── sinks/
-│   ├── sqlite_sink.py   # Local dev
-│   ├── jsonl_sink.py    # Fallback
-│   ├── postgres_sink.py # Production (Neon, Supabase compatible)
-│   └── otel_sink.py     # OTLP export (Jaeger, Honeycomb, Datadog, etc.)
-└── viewer/
-    └── app.py      # FastAPI viewer
+├── sinks/          # Storage backends
+└── viewer/         # FastAPI UI
 ```
-
-### PostgreSQL Sink Design
-
-The Postgres sink follows production best practices:
-
-- **Parameterized queries** - All queries use `%s` placeholders (SQL injection safe)
-- **Batch inserts** - Uses `executemany` for efficient bulk writes
-- **Retry with backoff** - Transient connection errors retry with exponential backoff
-- **Connection timeout** - 10-second timeout prevents hanging connections
-- **Graceful degradation** - Works with pre-created tables (no CREATE permission needed)
-- **Efficient schema checks** - Single query to verify all tables exist
-
-## Roadmap
-
-- [ ] Auto-instrumentation for OpenAI SDK
-- [ ] Auto-instrumentation for Anthropic SDK
-- [ ] SQL query validation policies
-- [ ] Network domain restriction policies
-- [ ] Streaming support for LLM responses
-- [ ] Sampling for high-volume production
 
 ## Development
 
 ```bash
-# Install with dev dependencies
 pip install -e ".[dev]"
-
-# Run tests
 pytest
-
-# Run linting
 ruff check .
-
-# Type checking
-mypy agent_observe
 ```
 
 ## License
 
-MIT License - see LICENSE file for details.
+MIT License
