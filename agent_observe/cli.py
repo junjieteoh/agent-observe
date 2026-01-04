@@ -169,6 +169,8 @@ def cmd_export_jsonl(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     """Main CLI entry point."""
+    from agent_observe import __version__
+
     parser = argparse.ArgumentParser(
         prog="agent-observe",
         description="Observability, audit, and eval for AI agent applications",
@@ -176,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s 0.1.0",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "-v",

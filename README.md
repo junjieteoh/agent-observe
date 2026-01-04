@@ -200,7 +200,10 @@ agent-observe view --database-url postgresql://...
 ```python
 from agent_observe import observe
 
-# Initialize
+# Initialize (reads from environment variables automatically)
+observe.install()
+
+# Or with mode override
 observe.install(mode="metadata_only")
 
 # Create a run context
@@ -212,6 +215,33 @@ observe.emit_event("custom.event", {"key": "value"})
 
 # Emit artifacts
 observe.emit_artifact("report", {"data": "..."}, provenance=["tool1", "tool2"])
+```
+
+### Explicit Configuration
+
+When you need full control, pass a `Config` object. **Important:** You must include
+all connection strings explicitly - they are NOT read from environment variables
+when using a custom Config:
+
+```python
+import os
+from agent_observe import observe
+from agent_observe.config import Config, CaptureMode, Environment, SinkType
+
+# Option 1: Let the library auto-detect from env vars (recommended)
+observe.install()
+
+# Option 2: Explicit config - must include ALL required fields
+database_url = os.environ.get("DATABASE_URL")
+
+config = Config(
+    mode=CaptureMode.METADATA_ONLY,
+    env=Environment.PROD,
+    sink_type=SinkType.POSTGRES,
+    project="my-agent",
+    database_url=database_url,  # Required for Postgres!
+)
+observe.install(config=config)
 ```
 
 ### Decorators
@@ -240,11 +270,22 @@ agent_observe/
 ├── sinks/
 │   ├── sqlite_sink.py   # Local dev
 │   ├── jsonl_sink.py    # Fallback
-│   ├── postgres_sink.py # Production
+│   ├── postgres_sink.py # Production (Neon, Supabase compatible)
 │   └── otel_sink.py     # OTLP export (Jaeger, Honeycomb, Datadog, etc.)
 └── viewer/
     └── app.py      # FastAPI viewer
 ```
+
+### PostgreSQL Sink Design
+
+The Postgres sink follows production best practices:
+
+- **Parameterized queries** - All queries use `%s` placeholders (SQL injection safe)
+- **Batch inserts** - Uses `executemany` for efficient bulk writes
+- **Retry with backoff** - Transient connection errors retry with exponential backoff
+- **Connection timeout** - 10-second timeout prevents hanging connections
+- **Graceful degradation** - Works with pre-created tables (no CREATE permission needed)
+- **Efficient schema checks** - Single query to verify all tables exist
 
 ## Roadmap
 

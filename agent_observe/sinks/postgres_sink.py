@@ -2,19 +2,32 @@
 PostgreSQL sink for agent-observe.
 
 Production-ready sink for multi-instance deployments.
-Uses psycopg3 with connection pooling for optimal performance.
+Uses psycopg3 for PostgreSQL connectivity.
+
+Design decisions:
+- Simple connection-per-operation (no pool) for minimal dependencies
+- Parameterized queries throughout (SQL injection safe)
+- Retry logic for transient connection failures
+- Batch inserts using executemany for performance
+- Graceful degradation when tables pre-exist (no CREATE permission needed)
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 from agent_observe.sinks.base import Sink
 
 logger = logging.getLogger(__name__)
+
+# Connection settings
+CONNECTION_TIMEOUT_SECONDS = 10
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 0.5
 
 # Allowed values for validation
 ALLOWED_STATUSES = {"ok", "error", "blocked"}
@@ -77,9 +90,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_project_env ON runs(project, env);
 
 -- Spans table
 CREATE TABLE IF NOT EXISTS spans (
-    span_id UUID PRIMARY KEY,
+    span_id TEXT PRIMARY KEY,
     run_id UUID NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    parent_span_id UUID,
+    parent_span_id TEXT,
     kind TEXT NOT NULL,
     name TEXT NOT NULL,
     ts_start TIMESTAMPTZ NOT NULL,
@@ -128,7 +141,7 @@ class PostgresSink(Sink):
     PostgreSQL-based sink for production deployments.
 
     Features:
-    - Connection pooling via psycopg_pool
+    - Simple psycopg3 connections (no pool dependency)
     - Neon-compatible
     - Full query support for viewer
     - Automatic schema creation and migrations
@@ -138,8 +151,6 @@ class PostgresSink(Sink):
         self,
         database_url: str,
         async_writes: bool = True,
-        min_pool_size: int = 1,
-        max_pool_size: int = 10,
     ):
         """
         Initialize PostgreSQL sink.
@@ -147,62 +158,148 @@ class PostgresSink(Sink):
         Args:
             database_url: PostgreSQL connection string.
             async_writes: If True, writes are queued and flushed in background.
-            min_pool_size: Minimum connection pool size.
-            max_pool_size: Maximum connection pool size.
         """
         super().__init__(async_writes=async_writes)
         self.database_url = database_url
-        self.min_pool_size = min_pool_size
-        self.max_pool_size = max_pool_size
-        self._pool: Any = None
+        self._initialized = False
+
+    def _get_connection(self) -> Any:
+        """
+        Get a new database connection with timeout.
+
+        Uses autocommit=False for explicit transaction control.
+        """
+        import psycopg
+
+        return psycopg.connect(
+            self.database_url,
+            connect_timeout=CONNECTION_TIMEOUT_SECONDS,
+            autocommit=False,
+        )
+
+    def _execute_with_retry(
+        self,
+        operation: str,
+        func: Any,
+    ) -> Any:
+        """
+        Execute a database operation with retry logic for transient failures.
+
+        Args:
+            operation: Description of the operation (for logging).
+            func: Callable that performs the database operation.
+
+        Returns:
+            Result of the operation, or None if all retries failed.
+        """
+        last_error: Exception | None = None
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                return func()
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+
+                # Check if this is a transient/retryable error
+                is_transient = any(
+                    keyword in error_str
+                    for keyword in [
+                        "connection",
+                        "timeout",
+                        "temporary",
+                        "unavailable",
+                        "too many connections",
+                        "connection refused",
+                        "network",
+                    ]
+                )
+
+                if is_transient and attempt < MAX_RETRIES - 1:
+                    delay = RETRY_DELAY_SECONDS * (2**attempt)  # Exponential backoff
+                    logger.warning(
+                        f"Transient error in {operation} (attempt {attempt + 1}/{MAX_RETRIES}), "
+                        f"retrying in {delay:.1f}s: {e}"
+                    )
+                    time.sleep(delay)
+                else:
+                    # Non-transient error or final attempt
+                    logger.error(f"Failed {operation} after {attempt + 1} attempts: {e}")
+                    raise
+
+        # Should not reach here, but just in case
+        if last_error:
+            raise last_error
+        return None
+
+    def _check_tables_exist(self, conn: Any) -> bool:
+        """
+        Check if required tables already exist in the database.
+
+        Uses a single query for efficiency.
+        """
+        required_tables = {"runs", "spans", "events"}
+        result = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_name = ANY(%s)",
+            (list(required_tables),),
+        ).fetchall()
+
+        existing_tables = {row[0] for row in result}
+        return required_tables.issubset(existing_tables)
 
     def _do_initialize(self) -> None:
-        """Create connection pool and schema."""
+        """Initialize connection and schema."""
         try:
-            from psycopg_pool import ConnectionPool
+            import psycopg  # noqa: F401
         except ImportError as e:
             raise ImportError(
-                "psycopg[pool] is required for PostgreSQL sink. "
+                "psycopg is required for PostgreSQL sink. "
                 "Install with: pip install 'agent-observe[postgres]'"
             ) from e
 
-        pool = None
         try:
-            pool = ConnectionPool(
-                self.database_url,
-                min_size=self.min_pool_size,
-                max_size=self.max_pool_size,
-                open=True,
-            )
+            with self._get_connection() as conn:
+                # Check if tables already exist first
+                tables_exist = self._check_tables_exist(conn)
 
-            # Create schema
-            with pool.connection() as conn:
-                conn.execute(SCHEMA_SQL)
+                if tables_exist:
+                    logger.info("PostgreSQL tables already exist, skipping schema creation")
+                else:
+                    # Try to create schema
+                    try:
+                        conn.execute(SCHEMA_SQL)
+                        conn.commit()
+                        logger.info("PostgreSQL schema created successfully")
+                    except Exception as schema_error:
+                        conn.rollback()
+                        raise RuntimeError(
+                            f"Cannot create schema (tables don't exist and no CREATE permission). "
+                            f"Please create tables manually - see AGENTS.md for SQL schema. "
+                            f"Error: {schema_error}"
+                        ) from schema_error
 
-                # Record schema version if not present
-                result = conn.execute(
-                    "SELECT version FROM agent_observe_schema_version "
-                    "ORDER BY version DESC LIMIT 1"
-                ).fetchone()
+                # Record schema version if not present (optional, may fail if table doesn't exist)
+                try:
+                    result = conn.execute(
+                        "SELECT version FROM agent_observe_schema_version "
+                        "ORDER BY version DESC LIMIT 1"
+                    ).fetchone()
 
-                if result is None:
-                    conn.execute(
-                        "INSERT INTO agent_observe_schema_version (version) VALUES (%s)",
-                        (SCHEMA_VERSION,),
-                    )
-                conn.commit()
+                    if result is None:
+                        conn.execute(
+                            "INSERT INTO agent_observe_schema_version (version) VALUES (%s)",
+                            (SCHEMA_VERSION,),
+                        )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    logger.debug("Schema version tracking skipped (table may not exist)")
 
-            # Only assign to instance after successful initialization
-            self._pool = pool
+            self._initialized = True
             logger.info("PostgreSQL sink initialized")
 
         except Exception:
-            # Clean up pool on failure to prevent resource leak
-            if pool is not None:
-                try:
-                    pool.close()
-                except Exception as cleanup_error:
-                    logger.warning(f"Error closing pool during cleanup: {cleanup_error}")
             raise
 
     def _ms_to_datetime(self, ms: int | None) -> datetime | None:
@@ -212,159 +309,203 @@ class PostgresSink(Sink):
         return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
 
     def _do_write_runs(self, runs: list[dict[str, Any]]) -> None:
-        """Write runs to PostgreSQL."""
-        if not self._pool:
+        """Write runs to PostgreSQL using batch insert."""
+        if not self._initialized or not runs:
             return
 
-        with self._pool.connection() as conn:
-            for run in runs:
-                conn.execute(
-                    """
-                    INSERT INTO runs (
-                        run_id, trace_id, name, ts_start, ts_end, task,
-                        agent_version, project, env, status,
-                        risk_score, eval_tags, policy_violations,
-                        tool_calls, model_calls, latency_ms
-                    ) VALUES (
-                        %s::uuid, %s, %s, %s, %s, %s::jsonb,
-                        %s, %s, %s, %s,
-                        %s, %s::jsonb, %s,
-                        %s, %s, %s
+        def _write() -> None:
+            with self._get_connection() as conn:
+                try:
+                    # Prepare batch data
+                    params_list = [
+                        (
+                            run.get("run_id"),
+                            run.get("trace_id"),
+                            run.get("name"),
+                            self._ms_to_datetime(run.get("ts_start")),
+                            self._ms_to_datetime(run.get("ts_end")),
+                            json.dumps(run.get("task")) if run.get("task") else None,
+                            run.get("agent_version"),
+                            run.get("project"),
+                            run.get("env"),
+                            run.get("status"),
+                            run.get("risk_score"),
+                            json.dumps(run.get("eval_tags")) if run.get("eval_tags") else None,
+                            run.get("policy_violations", 0),
+                            run.get("tool_calls", 0),
+                            run.get("model_calls", 0),
+                            run.get("latency_ms"),
+                        )
+                        for run in runs
+                    ]
+
+                    conn.executemany(
+                        """
+                        INSERT INTO runs (
+                            run_id, trace_id, name, ts_start, ts_end, task,
+                            agent_version, project, env, status,
+                            risk_score, eval_tags, policy_violations,
+                            tool_calls, model_calls, latency_ms
+                        ) VALUES (
+                            %s::uuid, %s, %s, %s, %s, %s::jsonb,
+                            %s, %s, %s, %s,
+                            %s, %s::jsonb, %s,
+                            %s, %s, %s
+                        )
+                        ON CONFLICT (run_id) DO UPDATE SET
+                            ts_end = EXCLUDED.ts_end,
+                            status = EXCLUDED.status,
+                            risk_score = EXCLUDED.risk_score,
+                            eval_tags = EXCLUDED.eval_tags,
+                            policy_violations = EXCLUDED.policy_violations,
+                            tool_calls = EXCLUDED.tool_calls,
+                            model_calls = EXCLUDED.model_calls,
+                            latency_ms = EXCLUDED.latency_ms
+                        """,
+                        params_list,
                     )
-                    ON CONFLICT (run_id) DO UPDATE SET
-                        ts_end = EXCLUDED.ts_end,
-                        status = EXCLUDED.status,
-                        risk_score = EXCLUDED.risk_score,
-                        eval_tags = EXCLUDED.eval_tags,
-                        policy_violations = EXCLUDED.policy_violations,
-                        tool_calls = EXCLUDED.tool_calls,
-                        model_calls = EXCLUDED.model_calls,
-                        latency_ms = EXCLUDED.latency_ms
-                    """,
-                    (
-                        run.get("run_id"),
-                        run.get("trace_id"),
-                        run.get("name"),
-                        self._ms_to_datetime(run.get("ts_start")),
-                        self._ms_to_datetime(run.get("ts_end")),
-                        json.dumps(run.get("task")) if run.get("task") else None,
-                        run.get("agent_version"),
-                        run.get("project"),
-                        run.get("env"),
-                        run.get("status"),
-                        run.get("risk_score"),
-                        json.dumps(run.get("eval_tags")) if run.get("eval_tags") else None,
-                        run.get("policy_violations", 0),
-                        run.get("tool_calls", 0),
-                        run.get("model_calls", 0),
-                        run.get("latency_ms"),
-                    ),
-                )
-            conn.commit()
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        self._execute_with_retry("write_runs", _write)
 
     def _do_write_spans(self, spans: list[dict[str, Any]]) -> None:
-        """Write spans to PostgreSQL."""
-        if not self._pool:
+        """Write spans to PostgreSQL using batch insert."""
+        if not self._initialized or not spans:
             return
 
-        with self._pool.connection() as conn:
-            for span in spans:
-                conn.execute(
-                    """
-                    INSERT INTO spans (
-                        span_id, run_id, parent_span_id, kind, name,
-                        ts_start, ts_end, status, attrs, error_message
-                    ) VALUES (
-                        %s::uuid, %s::uuid, %s::uuid, %s, %s,
-                        %s, %s, %s, %s::jsonb, %s
+        def _write() -> None:
+            with self._get_connection() as conn:
+                try:
+                    params_list = [
+                        (
+                            span.get("span_id"),
+                            span.get("run_id"),
+                            span.get("parent_span_id"),
+                            span.get("kind"),
+                            span.get("name"),
+                            self._ms_to_datetime(span.get("ts_start")),
+                            self._ms_to_datetime(span.get("ts_end")),
+                            span.get("status"),
+                            json.dumps(span.get("attrs")) if span.get("attrs") else None,
+                            span.get("error_message"),
+                        )
+                        for span in spans
+                    ]
+
+                    conn.executemany(
+                        """
+                        INSERT INTO spans (
+                            span_id, run_id, parent_span_id, kind, name,
+                            ts_start, ts_end, status, attrs, error_message
+                        ) VALUES (
+                            %s, %s::uuid, %s, %s, %s,
+                            %s, %s, %s, %s::jsonb, %s
+                        )
+                        ON CONFLICT (span_id) DO UPDATE SET
+                            ts_end = EXCLUDED.ts_end,
+                            status = EXCLUDED.status,
+                            attrs = EXCLUDED.attrs,
+                            error_message = EXCLUDED.error_message
+                        """,
+                        params_list,
                     )
-                    ON CONFLICT (span_id) DO UPDATE SET
-                        ts_end = EXCLUDED.ts_end,
-                        status = EXCLUDED.status,
-                        attrs = EXCLUDED.attrs,
-                        error_message = EXCLUDED.error_message
-                    """,
-                    (
-                        span.get("span_id"),
-                        span.get("run_id"),
-                        span.get("parent_span_id"),
-                        span.get("kind"),
-                        span.get("name"),
-                        self._ms_to_datetime(span.get("ts_start")),
-                        self._ms_to_datetime(span.get("ts_end")),
-                        span.get("status"),
-                        json.dumps(span.get("attrs")) if span.get("attrs") else None,
-                        span.get("error_message"),
-                    ),
-                )
-            conn.commit()
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        self._execute_with_retry("write_spans", _write)
 
     def _do_write_events(self, events: list[dict[str, Any]]) -> None:
-        """Write events to PostgreSQL."""
-        if not self._pool:
+        """Write events to PostgreSQL using batch insert."""
+        if not self._initialized or not events:
             return
 
-        with self._pool.connection() as conn:
-            for event in events:
-                conn.execute(
-                    """
-                    INSERT INTO events (
-                        event_id, run_id, ts, type, payload
-                    ) VALUES (
-                        %s::uuid, %s::uuid, %s, %s, %s::jsonb
+        def _write() -> None:
+            with self._get_connection() as conn:
+                try:
+                    params_list = [
+                        (
+                            event.get("event_id"),
+                            event.get("run_id"),
+                            self._ms_to_datetime(event.get("ts")),
+                            event.get("type"),
+                            json.dumps(event.get("payload")) if event.get("payload") else None,
+                        )
+                        for event in events
+                    ]
+
+                    conn.executemany(
+                        """
+                        INSERT INTO events (
+                            event_id, run_id, ts, type, payload
+                        ) VALUES (
+                            %s::uuid, %s::uuid, %s, %s, %s::jsonb
+                        )
+                        ON CONFLICT (event_id) DO NOTHING
+                        """,
+                        params_list,
                     )
-                    ON CONFLICT (event_id) DO NOTHING
-                    """,
-                    (
-                        event.get("event_id"),
-                        event.get("run_id"),
-                        self._ms_to_datetime(event.get("ts")),
-                        event.get("type"),
-                        json.dumps(event.get("payload")) if event.get("payload") else None,
-                    ),
-                )
-            conn.commit()
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        self._execute_with_retry("write_events", _write)
 
     def _do_write_replay_cache(self, entries: list[dict[str, Any]]) -> None:
-        """Write replay cache entries to PostgreSQL."""
-        if not self._pool:
+        """Write replay cache entries to PostgreSQL using batch insert."""
+        if not self._initialized or not entries:
             return
 
-        with self._pool.connection() as conn:
-            for entry in entries:
-                result = entry.get("result")
-                if result is not None and not isinstance(result, bytes):
-                    result = json.dumps(result).encode("utf-8")
+        def _write() -> None:
+            with self._get_connection() as conn:
+                try:
+                    params_list = []
+                    for entry in entries:
+                        result = entry.get("result")
+                        if result is not None and not isinstance(result, bytes):
+                            result = json.dumps(result).encode("utf-8")
 
-                conn.execute(
-                    """
-                    INSERT INTO replay_cache (
-                        key, tool_name, args_hash, tool_version,
-                        created_ts, status, result, result_hash
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (key) DO UPDATE SET
-                        status = EXCLUDED.status,
-                        result = EXCLUDED.result,
-                        result_hash = EXCLUDED.result_hash
-                    """,
-                    (
-                        entry.get("key"),
-                        entry.get("tool_name"),
-                        entry.get("args_hash"),
-                        entry.get("tool_version"),
-                        self._ms_to_datetime(entry.get("created_ts")),
-                        entry.get("status"),
-                        result,
-                        entry.get("result_hash"),
-                    ),
-                )
-            conn.commit()
+                        params_list.append(
+                            (
+                                entry.get("key"),
+                                entry.get("tool_name"),
+                                entry.get("args_hash"),
+                                entry.get("tool_version"),
+                                self._ms_to_datetime(entry.get("created_ts")),
+                                entry.get("status"),
+                                result,
+                                entry.get("result_hash"),
+                            )
+                        )
+
+                    conn.executemany(
+                        """
+                        INSERT INTO replay_cache (
+                            key, tool_name, args_hash, tool_version,
+                            created_ts, status, result, result_hash
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (key) DO UPDATE SET
+                            status = EXCLUDED.status,
+                            result = EXCLUDED.result,
+                            result_hash = EXCLUDED.result_hash
+                        """,
+                        params_list,
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        self._execute_with_retry("write_replay_cache", _write)
 
     def _do_close(self) -> None:
-        """Close connection pool."""
-        if self._pool:
-            self._pool.close()
-            self._pool = None
+        """Mark sink as closed."""
+        self._initialized = False
 
     # Query methods for viewer
 
@@ -378,7 +519,7 @@ class PostgresSink(Sink):
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Query runs with optional filters."""
-        if not self._pool:
+        if not self._initialized:
             return []
 
         query = "SELECT * FROM runs WHERE 1=1"
@@ -419,17 +560,17 @@ class PostgresSink(Sink):
         query += " ORDER BY ts_start DESC LIMIT %s OFFSET %s"
         params.extend([validated_limit, validated_offset])
 
-        with self._pool.connection() as conn:
+        with self._get_connection() as conn:
             result = conn.execute(query, params)
             columns = [desc.name for desc in result.description or []]
             return [self._row_to_dict(dict(zip(columns, row))) for row in result.fetchall()]
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         """Get a single run by ID."""
-        if not self._pool:
+        if not self._initialized:
             return None
 
-        with self._pool.connection() as conn:
+        with self._get_connection() as conn:
             result = conn.execute(
                 "SELECT * FROM runs WHERE run_id = %s::uuid",
                 (run_id,),
@@ -440,10 +581,10 @@ class PostgresSink(Sink):
 
     def get_spans(self, run_id: str) -> list[dict[str, Any]]:
         """Get all spans for a run."""
-        if not self._pool:
+        if not self._initialized:
             return []
 
-        with self._pool.connection() as conn:
+        with self._get_connection() as conn:
             result = conn.execute(
                 "SELECT * FROM spans WHERE run_id = %s::uuid ORDER BY ts_start",
                 (run_id,),
@@ -453,10 +594,10 @@ class PostgresSink(Sink):
 
     def get_events(self, run_id: str) -> list[dict[str, Any]]:
         """Get all events for a run."""
-        if not self._pool:
+        if not self._initialized:
             return []
 
-        with self._pool.connection() as conn:
+        with self._get_connection() as conn:
             result = conn.execute(
                 "SELECT * FROM events WHERE run_id = %s::uuid ORDER BY ts",
                 (run_id,),
@@ -466,10 +607,10 @@ class PostgresSink(Sink):
 
     def get_replay_cache_entry(self, key: str) -> dict[str, Any] | None:
         """Get a replay cache entry by key."""
-        if not self._pool:
+        if not self._initialized:
             return None
 
-        with self._pool.connection() as conn:
+        with self._get_connection() as conn:
             result = conn.execute(
                 "SELECT * FROM replay_cache WHERE key = %s",
                 (key,),

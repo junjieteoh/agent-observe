@@ -117,11 +117,13 @@ class OTLPSink(Sink):
             logger.warning("OTLP sink disabled due to missing dependencies")
             return
 
+        from agent_observe import __version__
+
         # Create resource with service info
         resource = Resource.create(
             {
                 "service.name": self.service_name,
-                "service.version": "0.1.0",
+                "service.version": __version__,
                 "telemetry.sdk.name": "agent-observe",
             }
         )
@@ -144,7 +146,7 @@ class OTLPSink(Sink):
         trace.set_tracer_provider(self._provider)
 
         # Get tracer
-        self._tracer = trace.get_tracer("agent-observe", "0.1.0")
+        self._tracer = trace.get_tracer("agent-observe", __version__)
 
         # Register cleanup
         atexit.register(self._shutdown_tracer)

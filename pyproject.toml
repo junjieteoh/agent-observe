@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-observe"
-version = "0.1.0"
+version = "0.1.1"
 description = "Framework-agnostic observability, audit, and eval for AI agent applications"
 readme = "README.md"
 license = "MIT"
@@ -49,7 +49,7 @@ viewer = [
     "jinja2>=3.1.0",
 ]
 postgres = [
-    "psycopg[pool]>=3.1.0",
+    "psycopg>=3.1.0",
 ]
 otlp = [
     "opentelemetry-api>=1.20.0",
@@ -120,7 +120,6 @@ warn_unused_ignores = true
 [[tool.mypy.overrides]]
 module = [
     "psycopg.*",
-    "psycopg_pool.*",
     "opentelemetry.*",
 ]
 ignore_missing_imports = true

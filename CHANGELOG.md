@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2025-01-04
+
+### Fixed
+- **PostgreSQL span_id type mismatch**: Changed `span_id` and `parent_span_id` from UUID to TEXT for OpenTelemetry compatibility (OTEL uses 16-char hex IDs)
+- **PostgreSQL permission handling**: Now gracefully detects pre-existing tables and skips schema creation when CREATE permission is missing
+
+### Added
+- **PostgreSQL retry logic**: Transient connection errors now retry with exponential backoff (3 attempts)
+- **PostgreSQL batch inserts**: Uses `executemany()` for efficient bulk writes
+- **PostgreSQL connection timeout**: 10-second timeout prevents hanging connections
+- **Efficient table checks**: Single query to verify all required tables exist
+- **Dynamic versioning**: Version is now read from package metadata across all modules
+- **Unit tests for PostgreSQL sink**: New tests that don't require a real database
+
+### Changed
+- Simplified PostgreSQL dependency from `psycopg[pool]` to just `psycopg`
+- Improved documentation with PostgreSQL best practices and manual schema SQL
+
 ## [0.1.0] - 2025-01-04
 
 ### Added
@@ -30,5 +48,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite
 - Example agents demonstrating usage
 
-[Unreleased]: https://github.com/junjieteoh/agent-observe/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/junjieteoh/agent-observe/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/junjieteoh/agent-observe/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/junjieteoh/agent-observe/releases/tag/v0.1.0

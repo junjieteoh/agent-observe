@@ -1,17 +1,124 @@
 """Tests for PostgreSQL sink.
 
-These are integration tests that require a running PostgreSQL database.
-They are skipped if DATABASE_URL is not set.
+Unit tests run without a database (using mocks).
+Integration tests require a running PostgreSQL database and are skipped if DATABASE_URL is not set.
 """
 
 from __future__ import annotations
 
 import os
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Skip all tests in this module if DATABASE_URL is not set
-pytestmark = pytest.mark.skipif(
+
+class TestPostgresSinkUnit:
+    """Unit tests for PostgresSink (no database required)."""
+
+    def test_check_tables_exist_all_present(self) -> None:
+        """Test _check_tables_exist when all tables exist."""
+        from agent_observe.sinks.postgres_sink import PostgresSink
+
+        sink = PostgresSink(database_url="postgresql://test", async_writes=False)
+
+        mock_conn = MagicMock()
+        # New implementation uses a single query returning all existing table names
+        mock_conn.execute.return_value.fetchall.return_value = [
+            ("runs",),
+            ("spans",),
+            ("events",),
+        ]
+
+        result = sink._check_tables_exist(mock_conn)
+        assert result is True
+        assert mock_conn.execute.call_count == 1  # Single efficient query
+
+    def test_check_tables_exist_missing_table(self) -> None:
+        """Test _check_tables_exist when a table is missing."""
+        from agent_observe.sinks.postgres_sink import PostgresSink
+
+        sink = PostgresSink(database_url="postgresql://test", async_writes=False)
+
+        mock_conn = MagicMock()
+        # Only runs and events exist, spans is missing
+        mock_conn.execute.return_value.fetchall.return_value = [
+            ("runs",),
+            ("events",),
+        ]
+
+        result = sink._check_tables_exist(mock_conn)
+        assert result is False
+
+    def test_initialization_skips_schema_when_tables_exist(self) -> None:
+        """Test that schema creation is skipped when tables already exist."""
+        from agent_observe.sinks.postgres_sink import PostgresSink
+
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+
+        # Tables exist
+        mock_conn.execute.return_value.fetchone.return_value = (True,)
+
+        with patch.object(PostgresSink, "_get_connection", return_value=mock_conn):
+            with patch.object(PostgresSink, "_check_tables_exist", return_value=True):
+                sink = PostgresSink(database_url="postgresql://test", async_writes=False)
+
+                # Mock the psycopg import
+                with patch.dict("sys.modules", {"psycopg": MagicMock()}):
+                    sink._do_initialize()
+
+                assert sink._initialized is True
+
+    def test_schema_sql_has_text_span_id(self) -> None:
+        """Verify span_id uses TEXT type for OpenTelemetry compatibility."""
+        from agent_observe.sinks.postgres_sink import SCHEMA_SQL
+
+        assert "span_id TEXT PRIMARY KEY" in SCHEMA_SQL
+        assert "parent_span_id TEXT" in SCHEMA_SQL
+        # Should NOT have UUID for span_id
+        assert "span_id UUID" not in SCHEMA_SQL
+
+    def test_write_spans_uses_text_not_uuid_cast(self) -> None:
+        """Verify span writes don't use ::uuid cast for span_id."""
+        from agent_observe.sinks.postgres_sink import PostgresSink
+
+        sink = PostgresSink(database_url="postgresql://test", async_writes=False)
+        sink._initialized = True
+
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(sink, "_get_connection", return_value=mock_conn):
+            # Write a span with 16-char span_id (OpenTelemetry format)
+            sink._do_write_spans([{
+                "span_id": "abc123def456789",  # 16 chars
+                "run_id": "550e8400-e29b-41d4-a716-446655440000",  # Full UUID
+                "parent_span_id": None,
+                "kind": "tool",
+                "name": "test",
+                "ts_start": 1704067200000,
+                "ts_end": 1704067201000,
+                "status": "ok",
+                "attrs": {},
+            }])
+
+        # Check that executemany was called (batch insert)
+        mock_conn.executemany.assert_called()
+        call_args = mock_conn.executemany.call_args
+        sql = call_args[0][0]
+
+        # The span_id should NOT be cast to uuid
+        # Pattern: VALUES (%s, %s::uuid, %s, ... where first %s is span_id (no cast),
+        # second is run_id (::uuid), third is parent_span_id (no cast)
+        normalized_sql = sql.replace("\n", "").replace(" ", "")
+        # Should have %s,%s::uuid,%s at the start of VALUES
+        assert "VALUES(%s,%s::uuid,%s," in normalized_sql
+
+
+# Integration tests - skip if no DATABASE_URL
+_skip_without_db = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
     reason="DATABASE_URL not set - skipping Postgres integration tests",
 )
@@ -54,8 +161,9 @@ def postgres_sink():
 
 
 @pytest.mark.integration
-class TestPostgresSink:
-    """Integration tests for PostgresSink."""
+@_skip_without_db
+class TestPostgresSinkIntegration:
+    """Integration tests for PostgresSink (requires DATABASE_URL)."""
 
     def test_write_and_read_run(self, postgres_sink) -> None:
         """Test writing and reading a run."""

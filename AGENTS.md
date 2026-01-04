@@ -668,6 +668,165 @@ You'll see:
 
 ---
 
+## Configuration
+
+### Auto-detection (Recommended)
+
+The simplest approach - just call `observe.install()` and it reads from environment variables:
+
+```python
+# Set environment variables
+# DATABASE_URL=postgresql://... (for Postgres sink)
+# AGENT_OBSERVE_MODE=metadata_only
+
+from agent_observe import observe
+
+observe.install()  # Auto-detects sink from DATABASE_URL
+```
+
+### Explicit Configuration
+
+When passing a `Config` object directly, you must include **all connection strings explicitly**.
+They are NOT read from environment variables in this case:
+
+```python
+import os
+from agent_observe import observe
+from agent_observe.config import Config, CaptureMode, Environment, SinkType
+
+# Get connection string from environment
+database_url = os.environ.get("DATABASE_URL")
+
+if database_url:
+    config = Config(
+        mode=CaptureMode.METADATA_ONLY,
+        env=Environment.PROD,
+        sink_type=SinkType.POSTGRES,
+        project="my-agent",
+        database_url=database_url,  # REQUIRED for Postgres!
+    )
+    observe.install(config=config)
+else:
+    # Fallback to auto-detection (will use JSONL or SQLite)
+    observe.install()
+```
+
+**Common mistake:** Setting `sink_type=SinkType.POSTGRES` but forgetting to pass `database_url`. This causes a silent fallback to NullSink.
+
+### PostgreSQL Setup
+
+Install the Postgres dependency:
+
+```bash
+pip install "agent-observe[postgres]"
+
+# Or manually:
+pip install "psycopg>=3.1.0"
+```
+
+#### Production Best Practices
+
+The PostgreSQL sink is designed for production use:
+
+| Feature | Implementation |
+|---------|----------------|
+| **SQL Injection Safe** | All queries use parameterized `%s` placeholders |
+| **Batch Inserts** | Uses `executemany` for efficient bulk writes |
+| **Retry Logic** | Transient errors retry with exponential backoff (3 attempts) |
+| **Connection Timeout** | 10-second timeout prevents hanging |
+| **Graceful Degradation** | Works with pre-created tables (no CREATE permission needed) |
+| **Efficient Checks** | Single query to verify all tables exist |
+
+#### Manual Table Creation
+
+If your database user doesn't have permission to create tables, run this SQL manually first:
+
+```sql
+-- Schema version tracking
+CREATE TABLE IF NOT EXISTS agent_observe_schema_version (
+    version INTEGER PRIMARY KEY,
+    applied_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Runs table
+CREATE TABLE IF NOT EXISTS runs (
+    run_id UUID PRIMARY KEY,
+    trace_id TEXT,
+    name TEXT NOT NULL,
+    ts_start TIMESTAMPTZ NOT NULL,
+    ts_end TIMESTAMPTZ,
+    task JSONB,
+    agent_version TEXT,
+    project TEXT,
+    env TEXT,
+    status TEXT CHECK (status IN ('ok', 'error', 'blocked')),
+    risk_score INTEGER,
+    eval_tags JSONB,
+    policy_violations INTEGER DEFAULT 0,
+    tool_calls INTEGER DEFAULT 0,
+    model_calls INTEGER DEFAULT 0,
+    latency_ms INTEGER,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_ts_start ON runs(ts_start DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_name ON runs(name);
+CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+CREATE INDEX IF NOT EXISTS idx_runs_risk_score ON runs(risk_score);
+CREATE INDEX IF NOT EXISTS idx_runs_project_env ON runs(project, env);
+
+-- Spans table (span_id is TEXT for OpenTelemetry compatibility)
+CREATE TABLE IF NOT EXISTS spans (
+    span_id TEXT PRIMARY KEY,
+    run_id UUID NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    parent_span_id TEXT,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    ts_start TIMESTAMPTZ NOT NULL,
+    ts_end TIMESTAMPTZ,
+    status TEXT CHECK (status IN ('ok', 'error', 'blocked')),
+    attrs JSONB,
+    error_message TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_spans_run_id ON spans(run_id);
+CREATE INDEX IF NOT EXISTS idx_spans_kind_name ON spans(kind, name);
+CREATE INDEX IF NOT EXISTS idx_spans_ts_start ON spans(ts_start);
+
+-- Events table
+CREATE TABLE IF NOT EXISTS events (
+    event_id UUID PRIMARY KEY,
+    run_id UUID NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    ts TIMESTAMPTZ NOT NULL,
+    type TEXT NOT NULL,
+    payload JSONB,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_run_id_type ON events(run_id, type);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+
+-- Replay cache table (optional, for tool replay feature)
+CREATE TABLE IF NOT EXISTS replay_cache (
+    key TEXT PRIMARY KEY,
+    tool_name TEXT NOT NULL,
+    args_hash TEXT NOT NULL,
+    tool_version TEXT,
+    created_ts TIMESTAMPTZ DEFAULT now(),
+    status TEXT CHECK (status IN ('ok', 'error')),
+    result BYTEA,
+    result_hash TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_tool_args ON replay_cache(tool_name, args_hash);
+
+-- Insert schema version
+INSERT INTO agent_observe_schema_version (version) VALUES (1);
+```
+
+---
+
 ## Best Practices
 
 1. **Wrap all external calls** - Any tool that calls an API, database, or file system should use `@tool`
@@ -681,3 +840,5 @@ You'll see:
 5. **Set up policies** - Create a policy file to block dangerous operations
 
 6. **Test with mocks first** - Validate observability before running real API tests
+
+7. **Prefer auto-detection** - Use `observe.install()` without config when possible, it handles env vars automatically
