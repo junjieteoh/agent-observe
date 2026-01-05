@@ -428,14 +428,19 @@ class ToolDecorator:
         tool_name: str,
     ) -> None:
         """Check tool policies and raise if violations block execution."""
-        policy_engine = observe.policy_engine
+        policy_engine = run.get_policy_engine()
+        if policy_engine is None:
+            logger.debug("No policy engine configured, skipping tool policy check")
+            return
+
+        fail_on_violation = run.get_fail_on_violation()
 
         # Check tool allowed
         violation = policy_engine.check_tool_allowed(tool_name)
         if violation:
             run.record_policy_violation()
             observe._emit_event_internal(run, "policy.violation", violation.to_dict())
-            if observe.config.fail_on_violation:
+            if fail_on_violation:
                 from agent_observe.policy import PolicyViolationError
 
                 raise PolicyViolationError(
@@ -447,7 +452,7 @@ class ToolDecorator:
         if limit_violation:
             run.record_policy_violation()
             observe._emit_event_internal(run, "policy.violation", limit_violation.to_dict())
-            if observe.config.fail_on_violation:
+            if fail_on_violation:
                 from agent_observe.policy import PolicyViolationError
 
                 raise PolicyViolationError(
@@ -505,7 +510,7 @@ class ToolDecorator:
             span.set_attribute("result_hash", result_hash)
 
             # Store actual content based on capture mode
-            capture_mode = observe.config.mode
+            capture_mode = run.get_capture_mode()
             if capture_mode == CaptureMode.FULL:
                 # Full mode: store everything
                 args_serialized = _serialize_for_storage(args_for_hash)
@@ -528,8 +533,8 @@ class ToolDecorator:
 
         except Exception as e:
             # Enhanced error context
-            capture_mode = observe.config.mode
-            error_context = _format_error_context(e, capture_mode, args_for_hash)
+            error_capture_mode = run.get_capture_mode()
+            error_context = _format_error_context(e, error_capture_mode, args_for_hash)
             span.set_attribute("error_context", error_context)
             span.set_status(SpanStatus.ERROR, str(e))
             run.record_retry()  # Record as potential retry
@@ -585,7 +590,7 @@ class ToolDecorator:
             span.set_attribute("result_hash", result_hash)
 
             # Store actual content based on capture mode
-            capture_mode = observe.config.mode
+            capture_mode = run.get_capture_mode()
             if capture_mode == CaptureMode.FULL:
                 # Full mode: store everything
                 args_serialized = _serialize_for_storage(args_for_hash)
@@ -608,7 +613,8 @@ class ToolDecorator:
 
         except Exception as e:
             # Enhanced error context
-            error_context = _format_error_context(e, capture_mode, args_for_hash)
+            error_capture_mode = run.get_capture_mode()
+            error_context = _format_error_context(e, error_capture_mode, args_for_hash)
             span.set_attribute("error_context", error_context)
             span.set_status(SpanStatus.ERROR, str(e))
             run.record_retry()  # Record as potential retry
@@ -693,12 +699,18 @@ class ModelCallDecorator:
 
     def _check_policies(self, run: Any, observe: Any) -> None:
         """Check model call policies."""
-        policy_engine = observe.policy_engine
+        policy_engine = run.get_policy_engine()
+        if policy_engine is None:
+            logger.debug("No policy engine configured, skipping model policy check")
+            return
+
+        fail_on_violation = run.get_fail_on_violation()
+
         limit_violation = policy_engine.check_model_call_limit(run.model_calls)
         if limit_violation:
             run.record_policy_violation()
             observe._emit_event_internal(run, "policy.violation", limit_violation.to_dict())
-            if observe.config.fail_on_violation:
+            if fail_on_violation:
                 from agent_observe.policy import PolicyViolationError
 
                 raise PolicyViolationError(
@@ -721,7 +733,7 @@ class ModelCallDecorator:
             return fn(*args, **kwargs)
 
         observe = run._observe
-        capture_mode = observe.config.mode
+        capture_mode = run.get_capture_mode()
 
         # Check policies
         self._check_policies(run, observe)
@@ -814,7 +826,7 @@ class ModelCallDecorator:
             return await fn(*args, **kwargs)
 
         observe = run._observe
-        capture_mode = observe.config.mode
+        capture_mode = run.get_capture_mode()
 
         # Check policies
         self._check_policies(run, observe)

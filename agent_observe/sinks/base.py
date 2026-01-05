@@ -11,6 +11,7 @@ import atexit
 import logging
 import queue
 import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -40,6 +41,23 @@ class WriteRequest:
     data: dict[str, Any]
 
 
+@dataclass
+class SinkMetrics:
+    """Internal metrics for the sink.
+
+    Tracks write operations, latency, and queue status for observability
+    of the observability system itself.
+    """
+
+    writes_total: int = 0
+    writes_failed: int = 0
+    write_latency_ms_sum: float = 0.0
+    write_latency_ms_count: int = 0
+    queue_high_watermark: int = 0
+    last_write_ts: float = 0.0
+    retries_total: int = 0
+
+
 class Sink(ABC):
     """
     Abstract base class for telemetry sinks.
@@ -53,6 +71,7 @@ class Sink(ABC):
         async_writes: bool = True,
         queue_size: int = 10000,
         flush_interval: float = 1.0,
+        max_retries: int = 3,
     ):
         """
         Initialize the sink.
@@ -61,13 +80,26 @@ class Sink(ABC):
             async_writes: If True, writes are queued and flushed in background.
             queue_size: Maximum queue size for async writes.
             flush_interval: Seconds between background flushes.
+            max_retries: Maximum retry attempts for failed writes.
         """
         self.async_writes = async_writes
         self._queue: queue.Queue[WriteRequest | None] = queue.Queue(maxsize=queue_size)
         self._flush_interval = flush_interval
+        self._max_retries = max_retries
         self._shutdown = threading.Event()
         self._writer_thread: threading.Thread | None = None
         self._initialized = False
+        self._metrics = SinkMetrics()
+
+    @property
+    def queue_depth(self) -> int:
+        """Current number of items waiting to be written."""
+        return self._queue.qsize()
+
+    @property
+    def metrics(self) -> SinkMetrics:
+        """Get sink metrics for monitoring."""
+        return self._metrics
 
     def initialize(self) -> None:
         """
@@ -184,13 +216,45 @@ class Sink(ABC):
                 self._queue.task_done()
 
     def _safe_flush_batch(self, batch: list[WriteRequest]) -> bool:
-        """Flush a batch with error handling. Returns True on success."""
-        try:
-            self._flush_batch(batch)
-            return True
-        except Exception as e:
-            logger.error(f"Error flushing batch ({len(batch)} items): {e}")
-            return False
+        """Flush a batch with retry and metrics tracking. Returns True on success."""
+        start_time = time.time()
+
+        for attempt in range(self._max_retries):
+            try:
+                self._flush_batch(batch)
+
+                # Track success metrics
+                elapsed_ms = (time.time() - start_time) * 1000
+                self._metrics.writes_total += len(batch)
+                self._metrics.write_latency_ms_sum += elapsed_ms
+                self._metrics.write_latency_ms_count += 1
+                self._metrics.last_write_ts = time.time()
+
+                # Track queue high watermark
+                current_depth = self._queue.qsize()
+                if current_depth > self._metrics.queue_high_watermark:
+                    self._metrics.queue_high_watermark = current_depth
+
+                return True
+
+            except Exception as e:
+                if attempt < self._max_retries - 1:
+                    wait_time = 2**attempt  # 1s, 2s, 4s exponential backoff
+                    logger.warning(
+                        f"Write failed (attempt {attempt + 1}/{self._max_retries}), "
+                        f"retrying in {wait_time}s: {e}"
+                    )
+                    self._metrics.retries_total += 1
+                    time.sleep(wait_time)
+                else:
+                    logger.error(
+                        f"Write failed after {self._max_retries} attempts "
+                        f"({len(batch)} items): {e}"
+                    )
+                    self._metrics.writes_failed += len(batch)
+                    return False
+
+        return False
 
     def _flush_batch(self, batch: list[WriteRequest]) -> None:
         """Flush a batch of write requests."""

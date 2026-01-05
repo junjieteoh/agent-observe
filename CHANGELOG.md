@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2025-01-05
+
+### Added
+- **Sink health metrics**: `SinkMetrics` dataclass tracks writes_total, writes_failed, retries_total, write latency, and queue high watermark
+- **Queue depth monitoring**: `sink.queue_depth` property exposes current backlog size
+- **Health check API**: `observe.health()` returns system status (healthy/degraded/unhealthy) with queue depth and write metrics
+- **Retry logic with exponential backoff**: Failed writes now retry up to 3 times with 1s, 2s, 4s backoff
+- **Span memory management**: `RunContext` now limits in-memory spans (default 10,000) and flushes to sink when exceeded
+
+### Changed
+- **Improved error handling**: Silent policy check returns now log at DEBUG level for better debuggability
+- **Safer cleanup on interrupts**: `run()` and `arun()` now catch `BaseException` to ensure cleanup on KeyboardInterrupt/SystemExit
+
+## [0.1.5] - 2025-01-05
+
+### Added
+- **Per-run config overrides**: Override settings per-run instead of only at `install()` time
+  - `mode`: Override capture mode for debugging specific runs - `observe.run("agent", mode="full")`
+  - `policy_file`: Apply different policy rules per agent - `observe.run("agent", policy_file="strict.yml")`
+  - `fail_on_violation`: Enable/disable strict mode per run - `observe.run("agent", fail_on_violation=True)`
+  - `latency_budget_ms`: Different SLAs per agent - `observe.run("agent", latency_budget_ms=5000)`
+- **RunContext accessor methods**: `get_capture_mode()`, `get_policy_engine()`, `get_fail_on_violation()`, `get_latency_budget_ms()` for consistent access to effective settings
+- **Backward compatible**: All new parameters are optional with `None` defaults; existing code works unchanged
+
 ## [0.1.4] - 2025-01-05
 
 ### Added
@@ -96,7 +120,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite
 - Example agents demonstrating usage
 
-[Unreleased]: https://github.com/junjieteoh/agent-observe/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/junjieteoh/agent-observe/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/junjieteoh/agent-observe/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/junjieteoh/agent-observe/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/junjieteoh/agent-observe/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/junjieteoh/agent-observe/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/junjieteoh/agent-observe/compare/v0.1.1...v0.1.2

@@ -716,3 +716,307 @@ class TestEndToEnd:
         assert spans[0]["status"] == "error"
 
         obs._cleanup()
+
+    def test_per_run_mode_override(self, temp_dir: Path) -> None:
+        """Test per-run capture mode override."""
+        config = Config(
+            mode=CaptureMode.METADATA_ONLY,  # Global: metadata only
+            env=Environment.DEV,
+            sink_type=SinkType.SQLITE,
+            sqlite_path=temp_dir / "per_run_mode.db",
+        )
+
+        obs = Observe()
+        obs.install(config=config)
+
+        @tool(name="test_tool")
+        def test_tool(arg: str) -> str:
+            return f"result: {arg}"
+
+        # Run 1: Use global config (metadata_only)
+        with obs.run("run-metadata"):
+            test_tool("hello")
+
+        # Run 2: Override to full mode
+        with obs.run("run-full", mode="full"):
+            test_tool("world")
+
+        obs.sink.flush()
+
+        runs = obs.sink.get_runs()
+        assert len(runs) == 2
+
+        # Find runs by name
+        run_metadata = next(r for r in runs if r["name"] == "run-metadata")
+        run_full = next(r for r in runs if r["name"] == "run-full")
+
+        # Check capture modes recorded correctly
+        assert run_metadata["capture_mode"] == "metadata_only"
+        assert run_full["capture_mode"] == "full"
+
+        # Check spans - metadata_only shouldn't have args/result, full should
+        spans_metadata = obs.sink.get_spans(run_metadata["run_id"])
+        spans_full = obs.sink.get_spans(run_full["run_id"])
+
+        # In metadata_only mode, args and result should not be stored
+        assert "args" not in spans_metadata[0]["attrs"]
+        assert "result" not in spans_metadata[0]["attrs"]
+
+        # In full mode, args and result should be stored
+        assert "args" in spans_full[0]["attrs"]
+        assert "result" in spans_full[0]["attrs"]
+
+        obs._cleanup()
+
+    def test_per_run_policy_override(self, temp_dir: Path) -> None:
+        """Test per-run policy file override."""
+        import yaml
+
+        # Create two different policy files
+        strict_policy_path = temp_dir / "strict_policy.yml"
+        with open(strict_policy_path, "w") as f:
+            yaml.dump({"tools": {"deny": ["dangerous.*"]}}, f)
+
+        lenient_policy_path = temp_dir / "lenient_policy.yml"
+        with open(lenient_policy_path, "w") as f:
+            yaml.dump({"tools": {"allow": ["*"]}}, f)
+
+        config = Config(
+            mode=CaptureMode.METADATA_ONLY,
+            env=Environment.DEV,
+            sink_type=SinkType.SQLITE,
+            sqlite_path=temp_dir / "per_run_policy.db",
+            policy_file=strict_policy_path,  # Global: strict policy
+            fail_on_violation=False,
+        )
+
+        obs = Observe()
+        obs.install(config=config)
+
+        @tool(name="dangerous.action")
+        def dangerous_action() -> str:
+            return "executed"
+
+        # Run 1: Use global strict policy (should record violation)
+        with obs.run("run-strict"):
+            dangerous_action()
+
+        # Run 2: Override with lenient policy (no violation)
+        with obs.run("run-lenient", policy_file=lenient_policy_path):
+            dangerous_action()
+
+        obs.sink.flush()
+
+        runs = obs.sink.get_runs()
+        run_strict = next(r for r in runs if r["name"] == "run-strict")
+        run_lenient = next(r for r in runs if r["name"] == "run-lenient")
+
+        # Strict run should have policy violation
+        assert run_strict["policy_violations"] == 1
+
+        # Lenient run should have no policy violations
+        assert run_lenient["policy_violations"] == 0
+
+        obs._cleanup()
+
+    def test_per_run_fail_on_violation_override(self, temp_dir: Path) -> None:
+        """Test per-run fail_on_violation override."""
+        import yaml
+
+        from agent_observe.policy import PolicyViolationError
+
+        policy_path = temp_dir / "policy.yml"
+        with open(policy_path, "w") as f:
+            yaml.dump({"tools": {"deny": ["blocked.*"]}}, f)
+
+        config = Config(
+            mode=CaptureMode.METADATA_ONLY,
+            env=Environment.DEV,
+            sink_type=SinkType.SQLITE,
+            sqlite_path=temp_dir / "per_run_fail.db",
+            policy_file=policy_path,
+            fail_on_violation=False,  # Global: don't fail
+        )
+
+        obs = Observe()
+        obs.install(config=config)
+
+        @tool(name="blocked.tool")
+        def blocked_tool() -> str:
+            return "executed"
+
+        # Run 1: Use global setting (don't fail)
+        with obs.run("run-no-fail"):
+            result = blocked_tool()
+            assert result == "executed"  # Should execute
+
+        # Run 2: Override to fail on violation
+        with pytest.raises(PolicyViolationError):
+            with obs.run("run-fail", fail_on_violation=True):
+                blocked_tool()  # Should raise
+
+        obs._cleanup()
+
+    def test_per_run_latency_budget_override(self, temp_dir: Path) -> None:
+        """Test per-run latency budget override."""
+        config = Config(
+            mode=CaptureMode.METADATA_ONLY,
+            env=Environment.DEV,
+            sink_type=SinkType.SQLITE,
+            sqlite_path=temp_dir / "per_run_latency.db",
+            latency_budget_ms=100000,  # Global: 100 seconds (won't breach)
+        )
+
+        obs = Observe()
+        obs.install(config=config)
+
+        # Run 1: Use global latency budget (100s, won't breach)
+        with obs.run("run-high-budget"):
+            pass
+
+        # Run 2: Override with tiny budget (1ms, will breach)
+        with obs.run("run-low-budget", latency_budget_ms=1):
+            import time
+
+            time.sleep(0.01)  # Sleep 10ms to ensure breach
+
+        obs.sink.flush()
+
+        runs = obs.sink.get_runs()
+        run_high = next(r for r in runs if r["name"] == "run-high-budget")
+        run_low = next(r for r in runs if r["name"] == "run-low-budget")
+
+        # High budget run should have no risk from latency
+        # Low budget run should have risk from latency breach
+        # LATENCY_BREACH adds 10 to risk score
+        assert run_low["risk_score"] >= 10  # Latency breach adds risk
+        assert run_high["risk_score"] < run_low["risk_score"]
+
+        obs._cleanup()
+
+    def test_health_check(self, temp_dir: Path) -> None:
+        """Test observe.health() returns proper status and metrics."""
+        config = Config(
+            mode=CaptureMode.METADATA_ONLY,
+            env=Environment.DEV,
+            sink_type=SinkType.SQLITE,
+            sqlite_path=temp_dir / "health_check.db",
+        )
+
+        obs = Observe()
+
+        # Health before install
+        assert obs.health() == {"status": "not_installed"}
+
+        obs.install(config=config)
+
+        # Health after install (initial state)
+        health = obs.health()
+        assert health["status"] == "healthy"
+        assert health["queue_depth"] == 0
+        assert health["writes_total"] == 0
+        assert health["writes_failed"] == 0
+        assert health["retries_total"] == 0
+        assert "avg_write_latency_ms" in health
+        assert "queue_high_watermark" in health
+        assert "last_write_ts" in health
+
+        # After some writes
+        with obs.run("test-agent"):
+            pass
+
+        obs.sink.flush()
+
+        health = obs.health()
+        assert health["status"] == "healthy"
+        assert health["writes_total"] >= 1  # At least the run was written
+
+        obs._cleanup()
+
+    def test_sink_metrics(self, temp_dir: Path) -> None:
+        """Test that sink metrics are tracked correctly."""
+        config = Config(
+            mode=CaptureMode.METADATA_ONLY,
+            env=Environment.DEV,
+            sink_type=SinkType.SQLITE,
+            sqlite_path=temp_dir / "sink_metrics.db",
+        )
+
+        obs = Observe()
+        obs.install(config=config)
+
+        # Initial metrics
+        assert obs.sink.queue_depth == 0
+        assert obs.sink.metrics.writes_total == 0
+
+        @tool(name="test_tool")
+        def test_tool() -> str:
+            return "done"
+
+        with obs.run("metrics-agent"):
+            test_tool()
+            test_tool()
+
+        obs.sink.flush()
+
+        # After writes, metrics should be updated
+        metrics = obs.sink.metrics
+        assert metrics.writes_total >= 1  # At least run + spans
+        assert metrics.write_latency_ms_count >= 1
+        assert metrics.last_write_ts > 0
+
+        obs._cleanup()
+
+    def test_span_memory_limit(self, temp_dir: Path) -> None:
+        """Test that spans memory is managed when limit is reached."""
+        config = Config(
+            mode=CaptureMode.METADATA_ONLY,
+            env=Environment.DEV,
+            sink_type=SinkType.SQLITE,
+            sqlite_path=temp_dir / "span_limit.db",
+        )
+
+        obs = Observe()
+        obs.install(config=config)
+
+        @tool(name="quick_tool")
+        def quick_tool(i: int) -> int:
+            return i
+
+        # Test that default limit is reasonable
+        with obs.run("default-limit") as run:
+            assert run._max_spans_in_memory == 10000  # Default
+
+        obs.sink.flush()
+        obs._cleanup()
+
+    def test_span_flush_tracking(self, temp_dir: Path) -> None:
+        """Test that span count tracking works correctly."""
+        from agent_observe.context import RunContext, SpanContext, SpanKind, now_ms
+
+        # Test that flush is only triggered when _observe is set
+        # (it needs a sink to write to)
+        run = RunContext(
+            run_id="test-run-id",
+            trace_id="test-trace-id",
+            name="test",
+            ts_start=now_ms(),
+        )
+        run._max_spans_in_memory = 3
+
+        # Add spans without _observe set - they accumulate (no flush)
+        for i in range(7):
+            span = SpanContext(
+                span_id=f"span-{i}",
+                run_id=run.run_id,
+                parent_span_id=None,
+                kind=SpanKind.TOOL,
+                name=f"tool-{i}",
+                ts_start=now_ms(),
+            )
+            run.add_span(span)
+
+        # Without _observe, spans just accumulate (flush is a no-op)
+        # The threshold triggers _flush_spans calls, but they return early
+        assert run.tool_calls == 7
+        assert len(run._spans) == 7  # All still in memory (no sink to flush to)

@@ -7,12 +7,19 @@ Provides the foundation for tracking nested tool calls and model invocations.
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from agent_observe.config import CaptureMode
+    from agent_observe.policy import PolicyEngine
 
 # Context variables for async-safe run/span tracking
 _current_run: ContextVar[RunContext | None] = ContextVar("current_run", default=None)
@@ -155,6 +162,51 @@ class RunContext:
     _tool_call_hashes: list[str] = field(default_factory=list, repr=False)
     _observe: Any | None = field(default=None, repr=False)  # Reference to Observe instance
 
+    # Per-run config overrides (None = use global config)
+    _mode_override: CaptureMode | None = field(default=None, repr=False)
+    _policy_engine_override: PolicyEngine | None = field(default=None, repr=False)
+    _fail_on_violation_override: bool | None = field(default=None, repr=False)
+    _latency_budget_ms_override: int | None = field(default=None, repr=False)
+
+    # Span memory management
+    _max_spans_in_memory: int = field(default=10000, repr=False)
+    _flushed_span_count: int = field(default=0, repr=False)
+
+    def get_capture_mode(self) -> CaptureMode:
+        """Get effective capture mode (per-run override or global config)."""
+        if self._mode_override is not None:
+            return self._mode_override
+        if self._observe is not None:
+            return self._observe.config.mode
+        # Fallback import to avoid circular dependency at runtime
+        from agent_observe.config import CaptureMode as CM
+
+        return CM.METADATA_ONLY
+
+    def get_policy_engine(self) -> PolicyEngine | None:
+        """Get effective policy engine (per-run override or global)."""
+        if self._policy_engine_override is not None:
+            return self._policy_engine_override
+        if self._observe is not None:
+            return self._observe.policy_engine
+        return None
+
+    def get_fail_on_violation(self) -> bool:
+        """Get effective fail_on_violation setting."""
+        if self._fail_on_violation_override is not None:
+            return self._fail_on_violation_override
+        if self._observe is not None:
+            return self._observe.config.fail_on_violation
+        return False
+
+    def get_latency_budget_ms(self) -> int:
+        """Get effective latency budget in milliseconds."""
+        if self._latency_budget_ms_override is not None:
+            return self._latency_budget_ms_override
+        if self._observe is not None:
+            return self._observe.config.latency_budget_ms
+        return 20000
+
     def add_span(self, span: SpanContext) -> None:
         """Record a span in this run."""
         self._spans.append(span)
@@ -162,6 +214,27 @@ class RunContext:
             self.tool_calls += 1
         elif span.kind == SpanKind.MODEL:
             self.model_calls += 1
+
+        # Flush if over memory limit
+        if len(self._spans) >= self._max_spans_in_memory:
+            self._flush_spans()
+
+    def _flush_spans(self) -> None:
+        """Flush accumulated spans to sink and clear memory."""
+        if self._observe is None or not self._spans:
+            return
+
+        try:
+            for span in self._spans:
+                self._observe.sink.write_span(span.to_dict())
+            self._flushed_span_count += len(self._spans)
+            logger.debug(
+                f"Flushed {len(self._spans)} spans to sink "
+                f"(total flushed: {self._flushed_span_count})"
+            )
+            self._spans.clear()
+        except Exception as e:
+            logger.warning(f"Failed to flush spans: {e}")
 
     def add_event(self, event: dict[str, Any]) -> None:
         """Record an event in this run."""

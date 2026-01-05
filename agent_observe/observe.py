@@ -14,6 +14,7 @@ import atexit
 import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from agent_observe.config import CaptureMode, Config, load_config
@@ -133,6 +134,55 @@ class Observe:
         """Check if observability is enabled (not OFF mode)."""
         return self._installed and self._config is not None and self._config.mode != CaptureMode.OFF
 
+    def health(self) -> dict[str, Any]:
+        """
+        Get health status of the observability system.
+
+        Returns:
+            dict with status, queue_depth, metrics, and other health info.
+
+        Example:
+            >>> obs.health()
+            {
+                'status': 'healthy',
+                'queue_depth': 42,
+                'writes_total': 1000,
+                'writes_failed': 2,
+                'avg_write_latency_ms': 5.3,
+                ...
+            }
+        """
+        if not self._installed:
+            return {"status": "not_installed"}
+
+        if self._sink is None:
+            return {"status": "no_sink"}
+
+        metrics = self._sink.metrics
+        queue_depth = self._sink.queue_depth
+
+        # Determine health status
+        status = "healthy"
+        if queue_depth > 5000:
+            status = "degraded"
+        if metrics.writes_total > 0 and metrics.writes_failed > metrics.writes_total * 0.1:
+            status = "unhealthy"
+
+        return {
+            "status": status,
+            "queue_depth": queue_depth,
+            "writes_total": metrics.writes_total,
+            "writes_failed": metrics.writes_failed,
+            "retries_total": metrics.retries_total,
+            "avg_write_latency_ms": (
+                metrics.write_latency_ms_sum / metrics.write_latency_ms_count
+                if metrics.write_latency_ms_count > 0
+                else 0.0
+            ),
+            "queue_high_watermark": metrics.queue_high_watermark,
+            "last_write_ts": metrics.last_write_ts,
+        }
+
     def install(
         self,
         config: Config | None = None,
@@ -225,6 +275,11 @@ class Observe:
         name: str,
         task: dict[str, Any] | None = None,
         agent_version: str | None = None,
+        *,
+        mode: str | CaptureMode | None = None,
+        policy_file: Path | str | None = None,
+        fail_on_violation: bool | None = None,
+        latency_budget_ms: int | None = None,
     ) -> Iterator[RunContext]:
         """
         Create a run context for an agent execution.
@@ -233,12 +288,21 @@ class Observe:
             name: Name of the run (e.g., "order-processor").
             task: Optional task metadata.
             agent_version: Override agent version (default from config).
+            mode: Override capture mode for this run (e.g., "full" for debugging).
+            policy_file: Override policy file for this run.
+            fail_on_violation: Override fail_on_violation for this run.
+            latency_budget_ms: Override latency budget for this run.
 
         Yields:
             RunContext for the run.
 
         Usage:
             with observe.run("my-agent") as run:
+                # agent code
+                pass
+
+            # Debug a specific run with full capture:
+            with observe.run("my-agent", mode="full") as run:
                 # agent code
                 pass
         """
@@ -266,39 +330,64 @@ class Observe:
             _observe=self,
         )
 
+        # Apply per-run overrides
+        if mode is not None:
+            if isinstance(mode, str):
+                # Convert string to CaptureMode enum
+                try:
+                    run_ctx._mode_override = CaptureMode(mode)
+                except ValueError:
+                    logger.warning(f"Invalid mode '{mode}', using global config")
+            else:
+                run_ctx._mode_override = mode
+
+        if policy_file is not None:
+            # Load a per-run policy
+            policy_path = Path(policy_file) if isinstance(policy_file, str) else policy_file
+            per_run_policy = load_policy(policy_path)
+            run_ctx._policy_engine_override = PolicyEngine(per_run_policy)
+
+        if fail_on_violation is not None:
+            run_ctx._fail_on_violation_override = fail_on_violation
+
+        if latency_budget_ms is not None:
+            run_ctx._latency_budget_ms_override = latency_budget_ms
+
         # Set as current run
         token = set_current_run(run_ctx)
 
         try:
             yield run_ctx
             run_ctx.end(RunStatus.OK)
-        except Exception as e:
+        except BaseException as e:
+            # Catch BaseException to handle KeyboardInterrupt, SystemExit too
             run_ctx.end(RunStatus.ERROR)
-            # Emit error event with sanitized message
-            self._emit_event_internal(
-                run_ctx,
-                "run.error",
-                {
-                    "error": sanitize_error_message(e),
-                    "error_type": type(e).__name__,
-                },
-            )
+            # Emit error event with sanitized message (only for Exception, not SystemExit)
+            if isinstance(e, Exception):
+                self._emit_event_internal(
+                    run_ctx,
+                    "run.error",
+                    {
+                        "error": sanitize_error_message(e),
+                        "error_type": type(e).__name__,
+                    },
+                )
             raise
         finally:
-            # Compute metrics and eval
-            eval_result = evaluate_run(run_ctx, self.config.latency_budget_ms)
+            # Compute metrics and eval (use per-run latency budget if set)
+            eval_result = evaluate_run(run_ctx, run_ctx.get_latency_budget_ms())
 
             # Build run data for storage
             run_data = run_ctx.to_dict()
             run_data["risk_score"] = eval_result.risk_score
             run_data["eval_tags"] = eval_result.eval_tags
             run_data["latency_ms"] = run_ctx.duration_ms
-            run_data["capture_mode"] = self.config.mode.value
+            run_data["capture_mode"] = run_ctx.get_capture_mode().value
 
-            # Write run to sink
+            # Write run to sink first (so FK constraints are satisfied)
             self.sink.write_run(run_data)
 
-            # Write spans
+            # Write spans (including any not yet flushed during streaming)
             for span in run_ctx.spans:
                 self.sink.write_span(span)
 
@@ -323,6 +412,11 @@ class Observe:
         name: str,
         task: dict[str, Any] | None = None,
         agent_version: str | None = None,
+        *,
+        mode: str | CaptureMode | None = None,
+        policy_file: Path | str | None = None,
+        fail_on_violation: bool | None = None,
+        latency_budget_ms: int | None = None,
     ) -> AsyncIterator[RunContext]:
         """
         Create an async run context for an agent execution.
@@ -331,6 +425,10 @@ class Observe:
             name: Name of the run (e.g., "order-processor").
             task: Optional task metadata.
             agent_version: Override agent version (default from config).
+            mode: Override capture mode for this run (e.g., "full" for debugging).
+            policy_file: Override policy file for this run.
+            fail_on_violation: Override fail_on_violation for this run.
+            latency_budget_ms: Override latency budget for this run.
 
         Yields:
             RunContext for the run.
@@ -364,36 +462,59 @@ class Observe:
             _observe=self,
         )
 
+        # Apply per-run overrides
+        if mode is not None:
+            if isinstance(mode, str):
+                try:
+                    run_ctx._mode_override = CaptureMode(mode)
+                except ValueError:
+                    logger.warning(f"Invalid mode '{mode}', using global config")
+            else:
+                run_ctx._mode_override = mode
+
+        if policy_file is not None:
+            policy_path = Path(policy_file) if isinstance(policy_file, str) else policy_file
+            per_run_policy = load_policy(policy_path)
+            run_ctx._policy_engine_override = PolicyEngine(per_run_policy)
+
+        if fail_on_violation is not None:
+            run_ctx._fail_on_violation_override = fail_on_violation
+
+        if latency_budget_ms is not None:
+            run_ctx._latency_budget_ms_override = latency_budget_ms
+
         # Set as current run
         token = set_current_run(run_ctx)
 
         try:
             yield run_ctx
             run_ctx.end(RunStatus.OK)
-        except Exception as e:
+        except BaseException as e:
+            # Catch BaseException to handle KeyboardInterrupt, SystemExit too
             run_ctx.end(RunStatus.ERROR)
-            # Emit error event with sanitized message
-            self._emit_event_internal(
-                run_ctx,
-                "run.error",
-                {
-                    "error": sanitize_error_message(e),
-                    "error_type": type(e).__name__,
-                },
-            )
+            # Emit error event with sanitized message (only for Exception, not SystemExit)
+            if isinstance(e, Exception):
+                self._emit_event_internal(
+                    run_ctx,
+                    "run.error",
+                    {
+                        "error": sanitize_error_message(e),
+                        "error_type": type(e).__name__,
+                    },
+                )
             raise
         finally:
-            # Compute metrics and eval
-            eval_result = evaluate_run(run_ctx, self.config.latency_budget_ms)
+            # Compute metrics and eval (use per-run latency budget if set)
+            eval_result = evaluate_run(run_ctx, run_ctx.get_latency_budget_ms())
 
             # Build run data for storage
             run_data = run_ctx.to_dict()
             run_data["risk_score"] = eval_result.risk_score
             run_data["eval_tags"] = eval_result.eval_tags
             run_data["latency_ms"] = run_ctx.duration_ms
-            run_data["capture_mode"] = self.config.mode.value
+            run_data["capture_mode"] = run_ctx.get_capture_mode().value
 
-            # Write run to sink
+            # Write run to sink first (so FK constraints are satisfied)
             self.sink.write_run(run_data)
 
             # Write spans
