@@ -261,13 +261,20 @@ class Observe:
         )
 
     def _cleanup(self) -> None:
-        """Cleanup on shutdown."""
+        """Cleanup on shutdown and reset state for re-installation."""
         if self._sink is not None:
             try:
                 self._sink.flush()
                 self._sink.close()
             except Exception as e:
                 logger.error(f"Error during cleanup: {e}")
+
+        # Reset state so install() can be called again (useful for testing)
+        self._installed = False
+        self._config = None
+        self._sink = None
+        self._policy_engine = None
+        self._replay_cache = None
 
     @contextmanager
     def run(
@@ -276,6 +283,14 @@ class Observe:
         task: dict[str, Any] | None = None,
         agent_version: str | None = None,
         *,
+        # v0.1.7: Attribution and context
+        user_id: str | None = None,
+        session_id: str | None = None,
+        prompt_version: str | None = None,
+        model_config: dict[str, Any] | None = None,
+        experiment_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        # Existing overrides
         mode: str | CaptureMode | None = None,
         policy_file: Path | str | None = None,
         fail_on_violation: bool | None = None,
@@ -288,6 +303,12 @@ class Observe:
             name: Name of the run (e.g., "order-processor").
             task: Optional task metadata.
             agent_version: Override agent version (default from config).
+            user_id: User/account ID for attribution.
+            session_id: Session/conversation ID for linking related runs.
+            prompt_version: Explicit prompt version (e.g., "v2.3").
+            model_config: Model configuration (model name, temperature, etc.).
+            experiment_id: A/B test or experiment cohort ID.
+            metadata: Custom metadata dictionary.
             mode: Override capture mode for this run (e.g., "full" for debugging).
             policy_file: Override policy file for this run.
             fail_on_violation: Override fail_on_violation for this run.
@@ -301,10 +322,16 @@ class Observe:
                 # agent code
                 pass
 
-            # Debug a specific run with full capture:
-            with observe.run("my-agent", mode="full") as run:
+            # With full context:
+            with observe.run(
+                "support-agent",
+                user_id="jane",
+                session_id="conv_123",
+                prompt_version="v2.3",
+            ) as run:
+                run.set_input(user_message)
                 # agent code
-                pass
+                run.set_output(response)
         """
         if not self.is_enabled:
             # Return a dummy context if not enabled
@@ -317,7 +344,7 @@ class Observe:
             yield dummy
             return
 
-        # Create run context
+        # Create run context with v0.1.7 fields
         run_ctx = RunContext(
             run_id=generate_uuid(),
             trace_id=generate_trace_id(),
@@ -327,6 +354,13 @@ class Observe:
             agent_version=agent_version or self.config.agent_version,
             project=self.config.project,
             env=self.config.env.value,
+            # v0.1.7: Attribution and context
+            user_id=user_id,
+            session_id=session_id,
+            prompt_version=prompt_version,
+            model_config=model_config,
+            experiment_id=experiment_id,
+            metadata=metadata or {},
             _observe=self,
         )
 
@@ -374,6 +408,10 @@ class Observe:
                 )
             raise
         finally:
+            # v0.1.7: Auto-infer input/output and prompt_hash if not explicitly set
+            run_ctx._infer_input_output()
+            run_ctx._infer_prompt_hash()
+
             # Compute metrics and eval (use per-run latency budget if set)
             eval_result = evaluate_run(run_ctx, run_ctx.get_latency_budget_ms())
 
@@ -413,6 +451,14 @@ class Observe:
         task: dict[str, Any] | None = None,
         agent_version: str | None = None,
         *,
+        # v0.1.7: Attribution and context
+        user_id: str | None = None,
+        session_id: str | None = None,
+        prompt_version: str | None = None,
+        model_config: dict[str, Any] | None = None,
+        experiment_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        # Existing overrides
         mode: str | CaptureMode | None = None,
         policy_file: Path | str | None = None,
         fail_on_violation: bool | None = None,
@@ -425,6 +471,12 @@ class Observe:
             name: Name of the run (e.g., "order-processor").
             task: Optional task metadata.
             agent_version: Override agent version (default from config).
+            user_id: User/account ID for attribution.
+            session_id: Session/conversation ID for linking related runs.
+            prompt_version: Explicit prompt version (e.g., "v2.3").
+            model_config: Model configuration (model name, temperature, etc.).
+            experiment_id: A/B test or experiment cohort ID.
+            metadata: Custom metadata dictionary.
             mode: Override capture mode for this run (e.g., "full" for debugging).
             policy_file: Override policy file for this run.
             fail_on_violation: Override fail_on_violation for this run.
@@ -449,7 +501,7 @@ class Observe:
             yield dummy
             return
 
-        # Create run context
+        # Create run context with v0.1.7 fields
         run_ctx = RunContext(
             run_id=generate_uuid(),
             trace_id=generate_trace_id(),
@@ -459,6 +511,13 @@ class Observe:
             agent_version=agent_version or self.config.agent_version,
             project=self.config.project,
             env=self.config.env.value,
+            # v0.1.7: Attribution and context
+            user_id=user_id,
+            session_id=session_id,
+            prompt_version=prompt_version,
+            model_config=model_config,
+            experiment_id=experiment_id,
+            metadata=metadata or {},
             _observe=self,
         )
 
@@ -504,6 +563,10 @@ class Observe:
                 )
             raise
         finally:
+            # v0.1.7: Auto-infer input/output and prompt_hash if not explicitly set
+            run_ctx._infer_input_output()
+            run_ctx._infer_prompt_hash()
+
             # Compute metrics and eval (use per-run latency budget if set)
             eval_result = evaluate_run(run_ctx, run_ctx.get_latency_budget_ms())
 

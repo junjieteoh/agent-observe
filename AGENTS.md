@@ -32,7 +32,7 @@ from agent_observe.config import Config
 
 # Create config with all settings
 config = Config(
-    mode="full",           # full | evidence_only | metadata_only | off
+    mode="full",           # full | evidence_only | metadata_only | off (default: full as of v0.1.7)
     env="dev",             # dev | staging | prod
     database_url="postgresql://user:pass@host/db",  # Optional: enables PostgreSQL
     pg_schema="public",    # PostgreSQL schema (default: public)
@@ -45,7 +45,7 @@ observe.install(config=config)
 **Alternative: Environment variables**
 
 ```bash
-export AGENT_OBSERVE_MODE=full
+export AGENT_OBSERVE_MODE=full       # Default as of v0.1.7
 export AGENT_OBSERVE_ENV=dev
 export DATABASE_URL=postgresql://user:pass@host/db
 export AGENT_OBSERVE_PG_SCHEMA=public  # PostgreSQL schema (default: public)
@@ -53,6 +53,122 @@ export AGENT_OBSERVE_PG_SCHEMA=public  # PostgreSQL schema (default: public)
 
 ```python
 observe.install()  # Reads from env vars automatically
+```
+
+## v0.1.7: Wide Event Traces
+
+v0.1.7 introduces **Wide Event** trace capture - comprehensive traces that capture everything needed to understand, debug, and audit your agent runs.
+
+### Run Attribution
+
+Add context to your runs for better debugging and analytics:
+
+```python
+with observe.run(
+    "support-agent",
+    user_id="jane_doe",              # Who triggered this run?
+    session_id="conversation_123",   # Part of which conversation?
+    prompt_version="v2.3",           # Which prompt version?
+    experiment_id="ab_test_new_rag", # A/B test cohort
+    model_config={"model": "gpt-4", "temperature": 0.7},
+    metadata={"customer_tier": "enterprise"},
+) as run:
+    # Your agent code here
+    pass
+```
+
+### Capturing Input/Output
+
+Record what your agent received and produced:
+
+```python
+with observe.run("support-agent", user_id="jane") as run:
+    # Capture the original user request
+    run.set_input(user_message)
+
+    # ... agent processing ...
+    response = call_llm(messages)
+    order_info = lookup_order(order_id)
+    final_response = format_response(response, order_info)
+
+    # Capture the final output
+    run.set_output(final_response)
+```
+
+**Auto-inference**: If you don't call `set_input()`/`set_output()`, they're automatically inferred from the first and last spans.
+
+### Adding Custom Metadata
+
+```python
+with observe.run("agent") as run:
+    run.add_metadata("customer_tier", "enterprise")
+    run.add_metadata("region", "us-west-2")
+    run.add_metadata("feature_flags", {"new_rag": True})
+```
+
+### Full LLM Context Capture
+
+`@model_call` now captures complete LLM context:
+
+```python
+@model_call(provider="openai", model="gpt-4")
+def call_llm(messages: list):
+    return openai.chat.completions.create(
+        model="gpt-4",
+        messages=messages,           # Full message history captured
+        temperature=0.7,             # Model config captured
+        tools=[...],                 # Tool definitions captured
+    )
+```
+
+The decorator automatically captures:
+- System prompt
+- Full message history
+- Model configuration (temperature, max_tokens, etc.)
+- Tool/function definitions
+- Response format
+
+### Prompt Hash (Auto-calculated)
+
+Each run automatically calculates a hash of the system prompt used:
+
+```python
+with observe.run("agent") as run:
+    call_llm([
+        {"role": "system", "content": "You are a helpful assistant..."},
+        {"role": "user", "content": "Hello"},
+    ])
+
+# After run completes:
+# run.prompt_hash = "abc123..." (auto-calculated from system prompt)
+```
+
+This lets you query runs by prompt version:
+```sql
+SELECT * FROM runs WHERE prompt_hash = 'abc123...'
+```
+
+### Session Continuity
+
+Link runs in a conversation:
+
+```python
+# First message
+with observe.run("agent", session_id="conv_123", user_id="jane") as run:
+    run.set_input("What's the weather?")
+    # ...
+    run.set_output("It's 72°F and sunny in SF.")
+
+# Follow-up message (same session)
+with observe.run("agent", session_id="conv_123", user_id="jane") as run:
+    run.set_input("What about tomorrow?")
+    # ...
+    run.set_output("Tomorrow will be 68°F with clouds.")
+```
+
+Query all runs in a session:
+```sql
+SELECT * FROM runs WHERE session_id = 'conv_123' ORDER BY ts_start
 ```
 
 ## Core Pattern
@@ -247,6 +363,20 @@ CREATE TABLE IF NOT EXISTS runs (
     tool_calls INTEGER DEFAULT 0,
     model_calls INTEGER DEFAULT 0,
     latency_ms INTEGER,
+    -- v0.1.7: Attribution fields
+    user_id TEXT,
+    session_id TEXT,
+    prompt_version TEXT,
+    prompt_hash TEXT,
+    model_config JSONB,
+    experiment_id TEXT,
+    -- v0.1.7: Content fields (Wide Event)
+    input_json TEXT,
+    input_text TEXT,
+    output_json TEXT,
+    output_text TEXT,
+    -- v0.1.7: Custom metadata
+    metadata JSONB,
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
@@ -281,6 +411,11 @@ CREATE INDEX idx_spans_run ON spans(run_id);
 CREATE INDEX idx_spans_parent ON spans(parent_span_id) WHERE parent_span_id IS NOT NULL;
 CREATE INDEX idx_events_run ON events(run_id);
 CREATE INDEX idx_eval_tags ON runs USING GIN (eval_tags);
+-- v0.1.7: Indexes for new fields
+CREATE INDEX idx_runs_user_id ON runs(user_id);
+CREATE INDEX idx_runs_session_id ON runs(session_id);
+CREATE INDEX idx_runs_prompt_version ON runs(prompt_version);
+CREATE INDEX idx_runs_experiment_id ON runs(experiment_id);
 ```
 
 ## Viewing Results

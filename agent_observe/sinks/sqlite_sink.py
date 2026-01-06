@@ -42,7 +42,7 @@ def _sanitize_identifier(value: str, max_length: int = 256) -> str:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v0.1.7: Added user_id, session_id, input/output, etc.
 
 SCHEMA_SQL = """
 -- Schema version tracking
@@ -70,6 +70,20 @@ CREATE TABLE IF NOT EXISTS runs (
     tool_calls INTEGER DEFAULT 0,
     model_calls INTEGER DEFAULT 0,
     latency_ms INTEGER,
+    -- v0.1.7: Attribution fields
+    user_id TEXT,
+    session_id TEXT,
+    prompt_version TEXT,
+    prompt_hash TEXT,
+    model_config TEXT,  -- JSON
+    experiment_id TEXT,
+    -- v0.1.7: Content fields (Wide Event)
+    input_json TEXT,
+    input_text TEXT,
+    output_json TEXT,
+    output_text TEXT,
+    -- v0.1.7: Custom metadata
+    metadata TEXT,  -- JSON
     created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -78,6 +92,11 @@ CREATE INDEX IF NOT EXISTS idx_runs_name ON runs(name);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_risk_score ON runs(risk_score);
 CREATE INDEX IF NOT EXISTS idx_runs_project_env ON runs(project, env);
+-- v0.1.7: Indexes for new fields
+CREATE INDEX IF NOT EXISTS idx_runs_user_id ON runs(user_id);
+CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(session_id);
+CREATE INDEX IF NOT EXISTS idx_runs_prompt_version ON runs(prompt_version);
+CREATE INDEX IF NOT EXISTS idx_runs_experiment_id ON runs(experiment_id);
 
 -- Spans table
 CREATE TABLE IF NOT EXISTS spans (
@@ -177,21 +196,80 @@ class SQLiteSink(Sink):
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
         conn = self._get_connection()
-        conn.executescript(SCHEMA_SQL)
 
-        # Record schema version if not present
+        # Check if tables exist and what version we have
         cursor = conn.execute(
-            "SELECT version FROM agent_observe_schema_version ORDER BY version DESC LIMIT 1"
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='agent_observe_schema_version'"
         )
-        row = cursor.fetchone()
-        if row is None:
+        has_schema_table = cursor.fetchone() is not None
+
+        current_version = 0
+        if has_schema_table:
+            cursor = conn.execute(
+                "SELECT version FROM agent_observe_schema_version ORDER BY version DESC LIMIT 1"
+            )
+            row = cursor.fetchone()
+            if row:
+                current_version = row[0]
+
+        # If fresh database, create schema
+        if current_version == 0:
+            conn.executescript(SCHEMA_SQL)
             conn.execute(
                 "INSERT INTO agent_observe_schema_version (version) VALUES (?)",
                 (SCHEMA_VERSION,),
             )
-        conn.commit()
+            conn.commit()
+            logger.info(f"SQLite sink initialized at {self.path}")
+            return
 
-        logger.info(f"SQLite sink initialized at {self.path}")
+        # Migrate from version 1 to version 2
+        if current_version < 2:
+            logger.info(f"Migrating SQLite schema from version {current_version} to {SCHEMA_VERSION}")
+            self._migrate_v1_to_v2(conn)
+            conn.execute(
+                "INSERT INTO agent_observe_schema_version (version) VALUES (?)",
+                (SCHEMA_VERSION,),
+            )
+            conn.commit()
+            logger.info(f"SQLite schema migrated to version {SCHEMA_VERSION}")
+
+    def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
+        """Migrate schema from v1 to v2 (add v0.1.7 fields)."""
+        # Add new columns to runs table (SQLite requires ALTER TABLE for each column)
+        new_columns = [
+            ("user_id", "TEXT"),
+            ("session_id", "TEXT"),
+            ("prompt_version", "TEXT"),
+            ("prompt_hash", "TEXT"),
+            ("model_config", "TEXT"),
+            ("experiment_id", "TEXT"),
+            ("input_json", "TEXT"),
+            ("input_text", "TEXT"),
+            ("output_json", "TEXT"),
+            ("output_text", "TEXT"),
+            ("metadata", "TEXT"),
+        ]
+
+        for col_name, col_type in new_columns:
+            try:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    logger.warning(f"Failed to add column {col_name}: {e}")
+
+        # Create new indexes
+        indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_runs_user_id ON runs(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(session_id)",
+            "CREATE INDEX IF NOT EXISTS idx_runs_prompt_version ON runs(prompt_version)",
+            "CREATE INDEX IF NOT EXISTS idx_runs_experiment_id ON runs(experiment_id)",
+        ]
+        for idx_sql in indexes:
+            try:
+                conn.execute(idx_sql)
+            except sqlite3.OperationalError as e:
+                logger.warning(f"Failed to create index: {e}")
 
     def _do_write_runs(self, runs: list[dict[str, Any]]) -> None:
         """Write runs to SQLite."""
@@ -204,8 +282,12 @@ class SQLiteSink(Sink):
                     run_id, trace_id, name, ts_start, ts_end, task,
                     agent_version, project, env, capture_mode, status,
                     risk_score, eval_tags, policy_violations,
-                    tool_calls, model_calls, latency_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tool_calls, model_calls, latency_ms,
+                    user_id, session_id, prompt_version, prompt_hash,
+                    model_config, experiment_id,
+                    input_json, input_text, output_json, output_text,
+                    metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.get("run_id"),
@@ -225,6 +307,19 @@ class SQLiteSink(Sink):
                     run.get("tool_calls", 0),
                     run.get("model_calls", 0),
                     run.get("latency_ms"),
+                    # v0.1.7: Attribution fields
+                    run.get("user_id"),
+                    run.get("session_id"),
+                    run.get("prompt_version"),
+                    run.get("prompt_hash"),
+                    json.dumps(run.get("model_config")) if run.get("model_config") else None,
+                    run.get("experiment_id"),
+                    # v0.1.7: Content fields
+                    run.get("input_json"),
+                    run.get("input_text"),
+                    run.get("output_json"),
+                    run.get("output_text"),
+                    json.dumps(run.get("metadata")) if run.get("metadata") else None,
                 ),
             )
 
@@ -427,7 +522,12 @@ class SQLiteSink(Sink):
         d = dict(row)
 
         # Parse JSON fields
-        for field in ("task", "attrs", "payload", "eval_tags"):
+        json_fields = (
+            "task", "attrs", "payload", "eval_tags",
+            # v0.1.7 fields
+            "model_config", "input_json", "output_json", "metadata",
+        )
+        for field in json_fields:
             if field in d and d[field] is not None and isinstance(d[field], str):
                 with contextlib.suppress(json.JSONDecodeError):
                     d[field] = json.loads(d[field])

@@ -60,9 +60,9 @@ def _to_capture_mode(value: CaptureMode | str) -> CaptureMode:
         try:
             return CaptureMode(value.lower())
         except ValueError:
-            logger.warning(f"Invalid capture mode '{value}', using metadata_only")
-            return CaptureMode.METADATA_ONLY
-    return CaptureMode.METADATA_ONLY
+            logger.warning(f"Invalid capture mode '{value}', using full")
+            return CaptureMode.FULL
+    return CaptureMode.FULL
 
 
 def _to_environment(value: Environment | str) -> Environment:
@@ -109,7 +109,8 @@ class Config:
     """Configuration for agent-observe. Accepts strings or enums for mode/env/sink."""
 
     # Core settings
-    mode: CaptureMode = CaptureMode.METADATA_ONLY
+    # v0.1.7: Default changed from METADATA_ONLY to FULL for comprehensive traces
+    mode: CaptureMode = CaptureMode.FULL
     env: Environment = Environment.PROD
     project: str = ""
     agent_version: str = ""
@@ -263,13 +264,13 @@ def load_config() -> Config:
         AGENT_OBSERVE_LATENCY_BUDGET_MS: Latency budget in ms (default: 20000)
         AGENT_OBSERVE_TRACE_SAMPLE_RATE: Trace sampling rate 0.0-1.0 (default: 0.1)
     """
-    # Parse mode
-    mode_str = os.environ.get("AGENT_OBSERVE_MODE", "metadata_only").lower()
+    # Parse mode (v0.1.7: default changed from metadata_only to full)
+    mode_str = os.environ.get("AGENT_OBSERVE_MODE", "full").lower()
     try:
         mode = CaptureMode(mode_str)
     except ValueError:
-        logger.warning(f"Invalid AGENT_OBSERVE_MODE: {mode_str}, using metadata_only")
-        mode = CaptureMode.METADATA_ONLY
+        logger.warning(f"Invalid AGENT_OBSERVE_MODE: {mode_str}, using full")
+        mode = CaptureMode.FULL
 
     # Parse environment
     env_str = os.environ.get("AGENT_OBSERVE_ENV", "prod").lower()

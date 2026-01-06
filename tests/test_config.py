@@ -22,7 +22,8 @@ class TestConfig:
         """Test default configuration values."""
         config = Config()
 
-        assert config.mode == CaptureMode.METADATA_ONLY
+        # v0.1.7: Default changed from METADATA_ONLY to FULL
+        assert config.mode == CaptureMode.FULL
         assert config.env == Environment.PROD
         assert config.sink_type == SinkType.AUTO
         assert config.fail_on_violation is False
@@ -102,7 +103,8 @@ class TestConfig:
             env="invalid_env",
         )
 
-        assert config.mode == CaptureMode.METADATA_ONLY
+        # v0.1.7: Default changed from METADATA_ONLY to FULL
+        assert config.mode == CaptureMode.FULL
         assert config.env == Environment.PROD
 
 
@@ -113,7 +115,8 @@ class TestLoadConfig:
         """Test loading config with defaults."""
         config = load_config()
 
-        assert config.mode == CaptureMode.METADATA_ONLY
+        # v0.1.7: Default changed from METADATA_ONLY to FULL
+        assert config.mode == CaptureMode.FULL
         assert config.env == Environment.PROD
         assert config.sink_type == SinkType.AUTO
 
@@ -141,7 +144,8 @@ class TestLoadConfig:
         config = load_config()
 
         # Should fall back to defaults
-        assert config.mode == CaptureMode.METADATA_ONLY
+        # v0.1.7: Default changed from METADATA_ONLY to FULL
+        assert config.mode == CaptureMode.FULL
         assert config.env == Environment.PROD
 
     def test_load_config_database_url(self) -> None:

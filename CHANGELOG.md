@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-01-05
+
+### Added
+- **Wide Event trace capture**: Comprehensive trace model inspired by "Logging sucks" philosophy
+  - `set_input()` / `set_output()`: Capture run-level input/output for complete context
+  - Auto-inference: Input/output automatically inferred from spans if not explicitly set
+  - `prompt_hash`: Auto-calculated hash of system prompt for version tracking
+
+- **Run attribution fields**: Better context for debugging and analytics
+  - `user_id`: Associate runs with users/accounts
+  - `session_id`: Link runs within a conversation/session
+  - `prompt_version`: Explicit prompt version (e.g., "v2.3")
+  - `experiment_id`: A/B test cohort tracking
+  - `model_config`: Model configuration (model name, temperature, etc.)
+  - `metadata`: Custom metadata dictionary via `run.add_metadata()`
+
+- **Full LLM context capture**: `@model_call` now captures complete LLM context
+  - System prompt, full message history
+  - Model configuration (temperature, max_tokens, etc.)
+  - Tools/functions definitions
+  - Stored in `llm_context` span attribute
+
+- **SQLite schema migration**: Automatic migration from v1 to v2 schema
+  - New columns added via ALTER TABLE for existing databases
+  - No manual migration required
+
+### Changed
+- **Default mode changed**: `full` is now the default capture mode (was `metadata_only`)
+  - Users install observability libraries because they want to see what happened
+  - Use `mode="metadata_only"` for minimal storage if needed
+
+- **Schema version bumped to 2**: New fields for Wide Event support
+  - `user_id`, `session_id`, `prompt_version`, `prompt_hash`
+  - `input_json`, `input_text`, `output_json`, `output_text`
+  - `model_config`, `experiment_id`, `metadata`
+
+### Migration from v0.1.6
+
+**Behavior change**: Default mode is now `full` capture.
+
+To keep old behavior:
+```python
+observe.install(mode="metadata_only")
+```
+
+**Schema changes**: New columns are nullable - no migration script needed. Old data has `NULL` for new fields.
+
 ## [0.1.6] - 2025-01-05
 
 ### Added
@@ -120,7 +167,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite
 - Example agents demonstrating usage
 
-[Unreleased]: https://github.com/junjieteoh/agent-observe/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/junjieteoh/agent-observe/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/junjieteoh/agent-observe/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/junjieteoh/agent-observe/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/junjieteoh/agent-observe/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/junjieteoh/agent-observe/compare/v0.1.3...v0.1.4

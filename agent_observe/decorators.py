@@ -116,6 +116,58 @@ def _extract_chunk_content(chunk: Any) -> str:
     return str(chunk) if chunk else ""
 
 
+def _extract_llm_context(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+    """
+    Extract full LLM context from function arguments.
+
+    This captures the complete context sent to the LLM for the Wide Event:
+    - System prompt
+    - Message history
+    - Model configuration
+    - Tools/functions
+    """
+    context: dict[str, Any] = {}
+
+    # Try to find messages in kwargs or args
+    messages = None
+    if "messages" in kwargs:
+        messages = kwargs["messages"]
+    elif args and isinstance(args[0], list):
+        # First positional arg might be messages
+        messages = args[0]
+
+    if messages and isinstance(messages, list):
+        context["messages"] = messages
+
+        # Extract system prompt from messages
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "system":
+                context["system_prompt"] = msg.get("content")
+                break
+
+    # Extract model configuration
+    for key in ("model", "temperature", "max_tokens", "top_p", "presence_penalty",
+                "frequency_penalty", "stop", "stream"):
+        if key in kwargs:
+            context[key] = kwargs[key]
+
+    # Extract tools/functions
+    if "tools" in kwargs:
+        context["tools"] = kwargs["tools"]
+    if "functions" in kwargs:
+        context["functions"] = kwargs["functions"]
+    if "tool_choice" in kwargs:
+        context["tool_choice"] = kwargs["tool_choice"]
+    if "function_call" in kwargs:
+        context["function_call"] = kwargs["function_call"]
+
+    # Extract response format
+    if "response_format" in kwargs:
+        context["response_format"] = kwargs["response_format"]
+
+    return context
+
+
 def _format_error_context(
     error: Exception,
     capture_mode: CaptureMode,
@@ -749,6 +801,16 @@ class ModelCallDecorator:
         input_hash = hash_json(input_for_hash)
         span.set_attribute("input_hash", input_hash)
 
+        # v0.1.7: Extract and store full LLM context (Wide Event)
+        llm_context = _extract_llm_context(args, kwargs)
+        if llm_context and capture_mode in (CaptureMode.FULL, CaptureMode.EVIDENCE_ONLY):
+            llm_context_serialized = _serialize_for_storage(
+                llm_context,
+                MAX_EVIDENCE_BYTES if capture_mode == CaptureMode.EVIDENCE_ONLY else None
+            )
+            if llm_context_serialized:
+                span.set_attribute("llm_context", llm_context_serialized)
+
         # Store input based on capture mode
         if capture_mode == CaptureMode.FULL:
             input_serialized = _serialize_for_storage(input_for_hash)
@@ -841,6 +903,16 @@ class ModelCallDecorator:
         input_for_hash = {"args": args, "kwargs": kwargs}
         input_hash = hash_json(input_for_hash)
         span.set_attribute("input_hash", input_hash)
+
+        # v0.1.7: Extract and store full LLM context (Wide Event)
+        llm_context = _extract_llm_context(args, kwargs)
+        if llm_context and capture_mode in (CaptureMode.FULL, CaptureMode.EVIDENCE_ONLY):
+            llm_context_serialized = _serialize_for_storage(
+                llm_context,
+                MAX_EVIDENCE_BYTES if capture_mode == CaptureMode.EVIDENCE_ONLY else None
+            )
+            if llm_context_serialized:
+                span.set_attribute("llm_context", llm_context_serialized)
 
         # Store input based on capture mode
         if capture_mode == CaptureMode.FULL:

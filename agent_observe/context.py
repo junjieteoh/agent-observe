@@ -149,11 +149,30 @@ class RunContext:
     ts_end: int | None = None
     status: RunStatus = RunStatus.OK
 
+    # v0.1.7: Attribution and context
+    user_id: str | None = None
+    session_id: str | None = None
+    prompt_version: str | None = None
+    model_config: dict[str, Any] | None = None
+    experiment_id: str | None = None
+
+    # v0.1.7: Run-level input/output (the Wide Event content)
+    input: Any | None = field(default=None, repr=False)
+    output: Any | None = field(default=None, repr=False)
+    _input_set_explicitly: bool = field(default=False, repr=False)
+    _output_set_explicitly: bool = field(default=False, repr=False)
+
+    # v0.1.7: Auto-calculated prompt hash
+    prompt_hash: str | None = None
+
     # Metrics (accumulated during run)
     tool_calls: int = 0
     model_calls: int = 0
     policy_violations: int = 0
     retry_count: int = 0
+
+    # Custom metadata
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     # Internal tracking
     _token: Token[RunContext] | None = field(default=None, repr=False)
@@ -206,6 +225,130 @@ class RunContext:
         if self._observe is not None:
             return self._observe.config.latency_budget_ms
         return 20000
+
+    def set_input(self, input_data: Any) -> None:
+        """
+        Set the original user request/input for this run.
+
+        Args:
+            input_data: The input to the agent (user message, request, etc.)
+        """
+        self.input = input_data
+        self._input_set_explicitly = True
+
+    def set_output(self, output_data: Any) -> None:
+        """
+        Set the final agent output for this run.
+
+        Args:
+            output_data: The output from the agent (response, result, etc.)
+        """
+        self.output = output_data
+        self._output_set_explicitly = True
+
+    def add_metadata(self, key: str, value: Any) -> None:
+        """
+        Add custom metadata to this run.
+
+        Args:
+            key: Metadata key.
+            value: Metadata value.
+        """
+        self.metadata[key] = value
+
+    def _infer_input_output(self) -> None:
+        """
+        Auto-infer input/output from spans if not explicitly set.
+
+        Called at run end to ensure we always have input/output for traces.
+        """
+        if not self._spans:
+            return
+
+        # Infer input from first span if not explicitly set
+        if not self._input_set_explicitly and self.input is None:
+            first_span = self._spans[0]
+            # Try to extract input from span attrs
+            if "input" in first_span.attrs:
+                self.input = first_span.attrs.get("input")
+                logger.debug(
+                    f"Run '{self.name}' input auto-inferred from span '{first_span.name}'"
+                )
+            elif "args" in first_span.attrs:
+                self.input = first_span.attrs.get("args")
+                logger.debug(
+                    f"Run '{self.name}' input auto-inferred from span '{first_span.name}' args"
+                )
+
+        # Infer output from last successful span if not explicitly set
+        if not self._output_set_explicitly and self.output is None:
+            for span in reversed(self._spans):
+                if span.status == SpanStatus.OK:
+                    if "output" in span.attrs:
+                        self.output = span.attrs.get("output")
+                        logger.debug(
+                            f"Run '{self.name}' output auto-inferred from span '{span.name}'"
+                        )
+                        break
+                    elif "result" in span.attrs:
+                        self.output = span.attrs.get("result")
+                        logger.debug(
+                            f"Run '{self.name}' output auto-inferred from span '{span.name}' result"
+                        )
+                        break
+
+    def _infer_prompt_hash(self) -> None:
+        """
+        Auto-calculate prompt hash from first model call's system prompt.
+
+        Called at run end if prompt_version not explicitly set.
+        """
+        if self.prompt_hash is not None or self.prompt_version is not None:
+            return  # Already set
+
+        for span in self._spans:
+            if span.kind == SpanKind.MODEL:
+                # Look for system prompt in LLM context
+                llm_context = span.attrs.get("llm_context")
+                if llm_context and isinstance(llm_context, dict):
+                    system_prompt = llm_context.get("system_prompt")
+                    if system_prompt:
+                        from agent_observe.hashing import hash_json
+                        self.prompt_hash = hash_json(system_prompt)[:16]
+                        logger.debug(
+                            f"Run '{self.name}' prompt_hash auto-calculated: {self.prompt_hash}"
+                        )
+                        return
+
+                # Try extracting from input messages
+                input_data = span.attrs.get("input")
+                if input_data:
+                    try:
+                        import json
+                        if isinstance(input_data, str):
+                            input_data = json.loads(input_data)
+                        if isinstance(input_data, dict):
+                            # Check kwargs.messages or args
+                            messages = None
+                            if "kwargs" in input_data:
+                                messages = input_data["kwargs"].get("messages")
+                            if not messages and "args" in input_data and input_data["args"]:
+                                first_arg = input_data["args"][0]
+                                if isinstance(first_arg, list):
+                                    messages = first_arg
+
+                            if messages:
+                                # Find system message
+                                for msg in messages:
+                                    if isinstance(msg, dict) and msg.get("role") == "system":
+                                        from agent_observe.hashing import hash_json
+                                        self.prompt_hash = hash_json(msg.get("content", ""))[:16]
+                                        logger.debug(
+                                            f"Run '{self.name}' prompt_hash auto-calculated from messages"
+                                        )
+                                        return
+                    except (json.JSONDecodeError, TypeError, KeyError):
+                        pass
 
     def add_span(self, span: SpanContext) -> None:
         """Record a span in this run."""
@@ -282,6 +425,38 @@ class RunContext:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert run to dictionary for storage."""
+        import json
+
+        # Serialize input/output to JSON strings for storage
+        input_json = None
+        input_text = None
+        if self.input is not None:
+            try:
+                if isinstance(self.input, str):
+                    input_json = json.dumps(self.input)
+                    input_text = self.input
+                else:
+                    input_json = json.dumps(self.input, default=str)
+                    # Extract text for FTS
+                    input_text = self._extract_text(self.input)
+            except (TypeError, ValueError):
+                input_json = str(self.input)
+                input_text = str(self.input)
+
+        output_json = None
+        output_text = None
+        if self.output is not None:
+            try:
+                if isinstance(self.output, str):
+                    output_json = json.dumps(self.output)
+                    output_text = self.output
+                else:
+                    output_json = json.dumps(self.output, default=str)
+                    output_text = self._extract_text(self.output)
+            except (TypeError, ValueError):
+                output_json = str(self.output)
+                output_text = str(self.output)
+
         return {
             "run_id": self.run_id,
             "trace_id": self.trace_id,
@@ -293,11 +468,52 @@ class RunContext:
             "project": self.project,
             "env": self.env,
             "status": self.status.value,
+            # v0.1.7: Attribution
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+            "prompt_version": self.prompt_version,
+            "prompt_hash": self.prompt_hash,
+            "model_config": self.model_config,
+            "experiment_id": self.experiment_id,
+            # v0.1.7: Content
+            "input_json": input_json,
+            "input_text": input_text,
+            "output_json": output_json,
+            "output_text": output_text,
+            # Metrics
             "tool_calls": self.tool_calls,
             "model_calls": self.model_calls,
             "policy_violations": self.policy_violations,
             "retry_count": self.retry_count,
+            # Custom metadata
+            "metadata": self.metadata if self.metadata else None,
         }
+
+    @staticmethod
+    def _extract_text(data: Any) -> str:
+        """Extract searchable text from data for FTS."""
+        if isinstance(data, str):
+            return data
+        if isinstance(data, dict):
+            # Extract common text fields
+            parts = []
+            for key in ("content", "text", "message", "response"):
+                if key in data:
+                    parts.append(str(data[key]))
+            if parts:
+                return " ".join(parts)
+            # Fallback to JSON
+            import json
+            return json.dumps(data, default=str)
+        if isinstance(data, list):
+            # Handle message lists
+            parts = []
+            for item in data:
+                if isinstance(item, dict) and "content" in item:
+                    parts.append(str(item["content"]))
+            if parts:
+                return " ".join(parts)
+        return str(data)
 
 
 def get_current_run() -> RunContext | None:

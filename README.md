@@ -11,10 +11,13 @@
 
 - **What tools were called** and when
 - **What LLM calls were made** and how long they took
+- **Full LLM context** - system prompts, message history, tool definitions (v0.1.7+)
+- **Run input/output** - what the user asked, what the agent responded (v0.1.7+)
+- **Session continuity** - link runs in a conversation (v0.1.7+)
 - **Policy violations** (blocked operations)
 - **Risk scores** based on behavioral signals
 
-Designed to be **enterprise-safe by default** - stores only metadata (hashes, sizes, timings), not raw content.
+As of v0.1.7, default mode is **full capture** - stores complete traces for debugging and audit.
 
 ## Installation
 
@@ -33,7 +36,7 @@ pip install agent-observe[viewer]
 ```python
 from agent_observe import observe, tool, model_call
 
-# Initialize (zero-config)
+# Initialize (zero-config, defaults to full capture as of v0.1.7)
 observe.install()
 
 # Wrap your tools
@@ -43,13 +46,27 @@ def search_web(query: str) -> list:
 
 # Wrap your LLM calls
 @model_call(provider="openai", model="gpt-4")
-def call_llm(prompt: str) -> str:
-    return openai.chat.completions.create(...).choices[0].message.content
+def call_llm(messages: list) -> str:
+    return openai.chat.completions.create(
+        model="gpt-4",
+        messages=messages,
+    ).choices[0].message.content
 
-# Run your agent
-with observe.run("my-agent", task={"goal": "Research AI"}):
+# Run your agent with context (v0.1.7+)
+with observe.run(
+    "my-agent",
+    user_id="jane",              # Who triggered this?
+    session_id="conv_123",       # Part of which conversation?
+) as run:
+    run.set_input("Research AI agents")  # Capture user request
+
     results = search_web("AI agents")
-    analysis = call_llm(f"Analyze: {results}")
+    analysis = call_llm([
+        {"role": "system", "content": "You are a research assistant"},
+        {"role": "user", "content": f"Analyze: {results}"},
+    ])
+
+    run.set_output(analysis)  # Capture final response
 ```
 
 View results:
@@ -94,11 +111,13 @@ See [Data Model](docs/DATA_MODEL.md) for details.
 
 | Mode | What's Stored | Use Case |
 |------|---------------|----------|
-| `metadata_only` | Hashes, timings | Production (default) |
-| `evidence_only` | Small content + hashes | Debugging |
-| `full` | Everything | Development |
+| `full` | Everything (default as of v0.1.7) | Development, debugging |
+| `evidence_only` | Small content + hashes (64KB limit) | Production with audit needs |
+| `metadata_only` | Hashes, timings only | High-security production |
 
-**Default is `metadata_only`** - enterprise-safe, no PII leakage.
+**Default is `full`** as of v0.1.7 - you install observability because you want to see what happened.
+
+For minimal storage: `observe.install(mode="metadata_only")`
 
 See [Capture Modes](docs/CAPTURE_MODES.md) for details.
 
@@ -125,7 +144,7 @@ observe.install()  # Reads from environment variables
 ### Environment Variables
 
 ```bash
-AGENT_OBSERVE_MODE=metadata_only    # Capture mode
+AGENT_OBSERVE_MODE=full             # Capture mode (default: full as of v0.1.7)
 AGENT_OBSERVE_ENV=prod              # Environment
 DATABASE_URL=postgresql://...       # Enables Postgres sink
 ```

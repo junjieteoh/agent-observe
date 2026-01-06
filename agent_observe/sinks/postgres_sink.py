@@ -52,7 +52,7 @@ def _sanitize_identifier(value: str, max_length: int = 256) -> str:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v0.1.7: Added user_id, session_id, input/output, etc.
 
 SCHEMA_SQL = """
 -- Schema version tracking
@@ -80,6 +80,20 @@ CREATE TABLE IF NOT EXISTS runs (
     tool_calls INTEGER DEFAULT 0,
     model_calls INTEGER DEFAULT 0,
     latency_ms INTEGER,
+    -- v0.1.7: Attribution fields
+    user_id TEXT,
+    session_id TEXT,
+    prompt_version TEXT,
+    prompt_hash TEXT,
+    model_config JSONB,
+    experiment_id TEXT,
+    -- v0.1.7: Content fields (Wide Event)
+    input_json TEXT,
+    input_text TEXT,
+    output_json TEXT,
+    output_text TEXT,
+    -- v0.1.7: Custom metadata
+    metadata JSONB,
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
@@ -89,6 +103,11 @@ CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_risk_score ON runs(risk_score);
 CREATE INDEX IF NOT EXISTS idx_runs_project_env ON runs(project, env);
 CREATE INDEX IF NOT EXISTS idx_runs_eval_tags ON runs USING GIN(eval_tags);
+-- v0.1.7: Indexes for new fields
+CREATE INDEX IF NOT EXISTS idx_runs_user_id ON runs(user_id);
+CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(session_id);
+CREATE INDEX IF NOT EXISTS idx_runs_prompt_version ON runs(prompt_version);
+CREATE INDEX IF NOT EXISTS idx_runs_experiment_id ON runs(experiment_id);
 
 -- Spans table
 CREATE TABLE IF NOT EXISTS spans (
@@ -178,6 +197,7 @@ class PostgresSink(Sink):
         Sets search_path to the configured schema.
         """
         import psycopg
+        from psycopg import sql
 
         conn = psycopg.connect(
             self.database_url,
@@ -185,7 +205,8 @@ class PostgresSink(Sink):
             autocommit=False,
         )
         # Set search_path to use the configured schema
-        conn.execute("SET search_path TO %s", (self.schema,))
+        # Note: SET doesn't support parameterized queries, use sql.Identifier for safety
+        conn.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
         return conn
 
     def _execute_with_retry(
@@ -259,6 +280,44 @@ class PostgresSink(Sink):
         existing_tables = {row[0] for row in result}
         return required_tables.issubset(existing_tables)
 
+    def _migrate_v1_to_v2(self, conn: Any) -> None:
+        """Migrate schema from v1 to v2 (add v0.1.7 fields)."""
+        # Add new columns to runs table
+        new_columns = [
+            ("user_id", "TEXT"),
+            ("session_id", "TEXT"),
+            ("prompt_version", "TEXT"),
+            ("prompt_hash", "TEXT"),
+            ("model_config", "JSONB"),
+            ("experiment_id", "TEXT"),
+            ("input_json", "TEXT"),
+            ("input_text", "TEXT"),
+            ("output_json", "TEXT"),
+            ("output_text", "TEXT"),
+            ("metadata", "JSONB"),
+        ]
+
+        for col_name, col_type in new_columns:
+            try:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
+            except Exception as e:
+                logger.warning(f"Failed to add column {col_name}: {e}")
+
+        # Create new indexes
+        indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_runs_user_id ON runs(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(session_id)",
+            "CREATE INDEX IF NOT EXISTS idx_runs_prompt_version ON runs(prompt_version)",
+            "CREATE INDEX IF NOT EXISTS idx_runs_experiment_id ON runs(experiment_id)",
+        ]
+        for idx_sql in indexes:
+            try:
+                conn.execute(idx_sql)
+            except Exception as e:
+                logger.warning(f"Failed to create index: {e}")
+
+        conn.commit()
+
     def _do_initialize(self) -> None:
         """Initialize connection and schema."""
         try:
@@ -271,15 +330,30 @@ class PostgresSink(Sink):
 
         try:
             with self._get_connection() as conn:
-                # Check if tables already exist first
+                # Check current schema version
+                current_version = 0
+                try:
+                    result = conn.execute(
+                        "SELECT version FROM agent_observe_schema_version "
+                        "ORDER BY version DESC LIMIT 1"
+                    ).fetchone()
+                    if result:
+                        current_version = result[0]
+                except Exception:
+                    # Table doesn't exist yet
+                    pass
+
+                # Check if tables already exist
                 tables_exist = self._check_tables_exist(conn)
 
-                if tables_exist:
-                    logger.info("PostgreSQL tables already exist, skipping schema creation")
-                else:
-                    # Try to create schema
+                if current_version == 0 and not tables_exist:
+                    # Fresh install - create full schema
                     try:
                         conn.execute(SCHEMA_SQL)
+                        conn.execute(
+                            "INSERT INTO agent_observe_schema_version (version) VALUES (%s)",
+                            (SCHEMA_VERSION,),
+                        )
                         conn.commit()
                         logger.info("PostgreSQL schema created successfully")
                     except Exception as schema_error:
@@ -289,23 +363,22 @@ class PostgresSink(Sink):
                             f"Please create tables manually - see AGENTS.md for SQL schema. "
                             f"Error: {schema_error}"
                         ) from schema_error
-
-                # Record schema version if not present (optional, may fail if table doesn't exist)
-                try:
-                    result = conn.execute(
-                        "SELECT version FROM agent_observe_schema_version "
-                        "ORDER BY version DESC LIMIT 1"
-                    ).fetchone()
-
-                    if result is None:
+                elif current_version < 2:
+                    # Migration needed from v1 to v2
+                    logger.info(f"Migrating PostgreSQL schema from version {current_version} to {SCHEMA_VERSION}")
+                    self._migrate_v1_to_v2(conn)
+                    try:
                         conn.execute(
                             "INSERT INTO agent_observe_schema_version (version) VALUES (%s)",
                             (SCHEMA_VERSION,),
                         )
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-                    logger.debug("Schema version tracking skipped (table may not exist)")
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        logger.debug("Schema version tracking skipped")
+                    logger.info(f"PostgreSQL schema migrated to version {SCHEMA_VERSION}")
+                else:
+                    logger.info("PostgreSQL tables already up to date")
 
             self._initialized = True
             logger.info("PostgreSQL sink initialized")
@@ -348,6 +421,19 @@ class PostgresSink(Sink):
                                 run.get("tool_calls", 0),
                                 run.get("model_calls", 0),
                                 run.get("latency_ms"),
+                                # v0.1.7: Attribution fields
+                                run.get("user_id"),
+                                run.get("session_id"),
+                                run.get("prompt_version"),
+                                run.get("prompt_hash"),
+                                json.dumps(run.get("model_config")) if run.get("model_config") else None,
+                                run.get("experiment_id"),
+                                # v0.1.7: Content fields
+                                run.get("input_json"),
+                                run.get("input_text"),
+                                run.get("output_json"),
+                                run.get("output_text"),
+                                json.dumps(run.get("metadata")) if run.get("metadata") else None,
                             )
                             for run in runs
                         ]
@@ -358,12 +444,20 @@ class PostgresSink(Sink):
                                 run_id, trace_id, name, ts_start, ts_end, task,
                                 agent_version, project, env, capture_mode, status,
                                 risk_score, eval_tags, policy_violations,
-                                tool_calls, model_calls, latency_ms
+                                tool_calls, model_calls, latency_ms,
+                                user_id, session_id, prompt_version, prompt_hash,
+                                model_config, experiment_id,
+                                input_json, input_text, output_json, output_text,
+                                metadata
                             ) VALUES (
                                 %s::uuid, %s, %s, %s, %s, %s::jsonb,
                                 %s, %s, %s, %s, %s,
                                 %s, %s::jsonb, %s,
-                                %s, %s, %s
+                                %s, %s, %s,
+                                %s, %s, %s, %s,
+                                %s::jsonb, %s,
+                                %s, %s, %s, %s,
+                                %s::jsonb
                             )
                             ON CONFLICT (run_id) DO UPDATE SET
                                 ts_end = EXCLUDED.ts_end,
@@ -373,7 +467,18 @@ class PostgresSink(Sink):
                                 policy_violations = EXCLUDED.policy_violations,
                                 tool_calls = EXCLUDED.tool_calls,
                                 model_calls = EXCLUDED.model_calls,
-                                latency_ms = EXCLUDED.latency_ms
+                                latency_ms = EXCLUDED.latency_ms,
+                                user_id = EXCLUDED.user_id,
+                                session_id = EXCLUDED.session_id,
+                                prompt_version = EXCLUDED.prompt_version,
+                                prompt_hash = EXCLUDED.prompt_hash,
+                                model_config = EXCLUDED.model_config,
+                                experiment_id = EXCLUDED.experiment_id,
+                                input_json = EXCLUDED.input_json,
+                                input_text = EXCLUDED.input_text,
+                                output_json = EXCLUDED.output_json,
+                                output_text = EXCLUDED.output_text,
+                                metadata = EXCLUDED.metadata
                             """,
                             params_list,
                         )

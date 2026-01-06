@@ -62,6 +62,19 @@ with observe.run("my-agent", task={"goal": "Research AI"}):
 | `project` | TEXT | Project name (from config) |
 | `env` | TEXT | Environment (dev/staging/prod) |
 | `agent_version` | TEXT | Your agent's version |
+| **v0.1.7 Attribution** | | |
+| `user_id` | TEXT | User/account ID for attribution |
+| `session_id` | TEXT | Session/conversation ID for linking runs |
+| `prompt_version` | TEXT | Explicit prompt version (e.g., "v2.3") |
+| `prompt_hash` | TEXT | Auto-calculated hash of system prompt |
+| `model_config` | JSONB | Model configuration (model, temperature, etc.) |
+| `experiment_id` | TEXT | A/B test or experiment cohort ID |
+| **v0.1.7 Content** | | |
+| `input_json` | TEXT | JSON-serialized input (what user asked) |
+| `input_text` | TEXT | Plain text input (for display) |
+| `output_json` | TEXT | JSON-serialized output (agent response) |
+| `output_text` | TEXT | Plain text output (for display) |
+| `metadata` | JSONB | Custom key-value metadata |
 
 ### Why track Runs?
 
@@ -127,6 +140,25 @@ Depends on the [capture mode](CAPTURE_MODES.md):
   "model": "gpt-4",
   "args_hash": "...",
   "result_hash": "..."
+}
+```
+
+**For model calls (v0.1.7 full mode - includes LLM context):**
+```json
+{
+  "provider": "openai",
+  "model": "gpt-4",
+  "args_hash": "...",
+  "result_hash": "...",
+  "llm_context": {
+    "messages": [...],
+    "system_prompt": "You are a helpful assistant...",
+    "model": "gpt-4",
+    "temperature": 0.7,
+    "max_tokens": 1000,
+    "tools": [...],
+    "tool_choice": "auto"
+  }
 }
 ```
 
