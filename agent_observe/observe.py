@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from agent_observe.config import CaptureMode, Config, load_config
+from agent_observe.pii import PIIConfig
 from agent_observe.context import (
     RunContext,
     RunStatus,
@@ -29,6 +30,8 @@ from agent_observe.context import (
     set_current_run,
 )
 from agent_observe.hashing import hash_content
+from agent_observe.hooks.context import RunEndContext, RunStartContext
+from agent_observe.hooks.registry import HookRegistry
 from agent_observe.metrics import evaluate_run
 from agent_observe.policy import PolicyEngine, load_policy
 from agent_observe.replay import ReplayCache
@@ -64,13 +67,13 @@ def sanitize_error_message(error: Exception, max_length: int = 500) -> str:
 
     message = str(error)
 
-    # Truncate first
-    if len(message) > max_length:
-        message = message[:max_length] + "...[truncated]"
-
-    # Redact potential secrets
+    # SECURITY: Redact FIRST, then truncate to avoid exposing secrets after truncation point
     for pattern in SECRET_PATTERNS:
         message = re.sub(pattern, "[REDACTED]", message)
+
+    # Truncate after redaction
+    if len(message) > max_length:
+        message = message[:max_length] + "...[truncated]"
 
     return message
 
@@ -95,6 +98,7 @@ class Observe:
         self._sink: Sink | None = None
         self._policy_engine: PolicyEngine | None = None
         self._replay_cache: ReplayCache | None = None
+        self._hooks: HookRegistry | None = None
 
     @property
     def config(self) -> Config:
@@ -123,6 +127,26 @@ class Observe:
         if self._replay_cache is None:
             raise RuntimeError("observe.install() has not been called")
         return self._replay_cache
+
+    @property
+    def hooks(self) -> HookRegistry:
+        """
+        Get hook registry for registering lifecycle hooks.
+
+        Usage:
+            @observe.hooks.before_tool
+            def my_hook(ctx):
+                pass
+
+            @observe.hooks.on_run_end
+            def log_completion(ctx):
+                print(f"Run completed: {ctx.status}")
+        """
+        if self._hooks is None:
+            # Create a default registry even if not installed
+            # This allows hooks to be registered before install()
+            self._hooks = HookRegistry()
+        return self._hooks
 
     @property
     def is_installed(self) -> bool:
@@ -189,6 +213,7 @@ class Observe:
         *,
         mode: str | None = None,
         sink_type: str | None = None,
+        pii: PIIConfig | dict | None = None,
     ) -> None:
         """
         Initialize observability.
@@ -200,6 +225,7 @@ class Observe:
             config: Optional explicit configuration (overrides env vars).
             mode: Override capture mode (off/metadata_only/evidence_only/full).
             sink_type: Override sink type (auto/sqlite/jsonl/postgres/otlp).
+            pii: PII configuration for pre-storage redaction/hashing.
         """
         if self._installed:
             logger.warning("observe.install() called multiple times")
@@ -225,6 +251,12 @@ class Observe:
                 **{**self._config.__dict__, "sink_type": ST(sink_type.lower())}
             )
 
+        # Apply PII configuration override
+        if pii is not None:
+            self._config = Config(
+                **{**self._config.__dict__, "pii": pii}
+            )
+
         # Initialize components
         try:
             self._sink = create_sink(self._config)
@@ -248,6 +280,13 @@ class Observe:
             mode=self._config.replay_mode,
             capture_mode=self._config.mode,
         )
+
+        # Initialize or update hook registry with current environment
+        if self._hooks is None:
+            self._hooks = HookRegistry(current_env=self._config.env.value)
+        else:
+            # Update existing registry with environment
+            self._hooks._current_env = self._config.env.value
 
         self._installed = True
 
@@ -390,10 +429,21 @@ class Observe:
         # Set as current run
         token = set_current_run(run_ctx)
 
+        # Call on_run_start hooks
+        if self._hooks is not None:
+            start_ctx = RunStartContext(
+                run=run_ctx,
+                observe=self,
+                timestamp_ms=now_ms(),
+            )
+            self._hooks.run_lifecycle_hooks("on_run_start", start_ctx)
+
+        run_error: BaseException | None = None
         try:
             yield run_ctx
             run_ctx.end(RunStatus.OK)
         except BaseException as e:
+            run_error = e
             # Catch BaseException to handle KeyboardInterrupt, SystemExit too
             run_ctx.end(RunStatus.ERROR)
             # Emit error event with sanitized message (only for Exception, not SystemExit)
@@ -414,6 +464,22 @@ class Observe:
 
             # Compute metrics and eval (use per-run latency budget if set)
             eval_result = evaluate_run(run_ctx, run_ctx.get_latency_budget_ms())
+
+            # Call on_run_end hooks
+            if self._hooks is not None:
+                end_ctx = RunEndContext(
+                    run=run_ctx,
+                    observe=self,
+                    status="error" if run_error else "ok",
+                    error=run_error if isinstance(run_error, Exception) else None,
+                    duration_ms=run_ctx.duration_ms or 0,
+                    timestamp_ms=now_ms(),
+                    tool_calls=run_ctx.tool_calls,
+                    model_calls=run_ctx.model_calls,
+                    policy_violations=run_ctx.policy_violations,
+                    spans=run_ctx.spans,
+                )
+                self._hooks.run_lifecycle_hooks("on_run_end", end_ctx)
 
             # Build run data for storage
             run_data = run_ctx.to_dict()
@@ -545,10 +611,21 @@ class Observe:
         # Set as current run
         token = set_current_run(run_ctx)
 
+        # Call on_run_start hooks (async)
+        if self._hooks is not None:
+            start_ctx = RunStartContext(
+                run=run_ctx,
+                observe=self,
+                timestamp_ms=now_ms(),
+            )
+            await self._hooks.run_lifecycle_hooks_async("on_run_start", start_ctx)
+
+        run_error: BaseException | None = None
         try:
             yield run_ctx
             run_ctx.end(RunStatus.OK)
         except BaseException as e:
+            run_error = e
             # Catch BaseException to handle KeyboardInterrupt, SystemExit too
             run_ctx.end(RunStatus.ERROR)
             # Emit error event with sanitized message (only for Exception, not SystemExit)
@@ -569,6 +646,22 @@ class Observe:
 
             # Compute metrics and eval (use per-run latency budget if set)
             eval_result = evaluate_run(run_ctx, run_ctx.get_latency_budget_ms())
+
+            # Call on_run_end hooks (async)
+            if self._hooks is not None:
+                end_ctx = RunEndContext(
+                    run=run_ctx,
+                    observe=self,
+                    status="error" if run_error else "ok",
+                    error=run_error if isinstance(run_error, Exception) else None,
+                    duration_ms=run_ctx.duration_ms or 0,
+                    timestamp_ms=now_ms(),
+                    tool_calls=run_ctx.tool_calls,
+                    model_calls=run_ctx.model_calls,
+                    policy_violations=run_ctx.policy_violations,
+                    spans=run_ctx.spans,
+                )
+                await self._hooks.run_lifecycle_hooks_async("on_run_end", end_ctx)
 
             # Build run data for storage
             run_data = run_ctx.to_dict()

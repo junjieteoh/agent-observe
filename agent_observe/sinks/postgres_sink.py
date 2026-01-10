@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -170,6 +171,9 @@ class PostgresSink(Sink):
     - Automatic schema creation and migrations
     """
 
+    # Valid PostgreSQL identifier pattern (letters, digits, underscores, starting with letter or underscore)
+    _VALID_IDENTIFIER_PATTERN = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
     def __init__(
         self,
         database_url: str,
@@ -183,9 +187,19 @@ class PostgresSink(Sink):
             database_url: PostgreSQL connection string.
             async_writes: If True, writes are queued and flushed in background.
             schema: PostgreSQL schema name (default: public).
+
+        Raises:
+            ValueError: If schema name contains invalid characters.
         """
         super().__init__(async_writes=async_writes)
         self.database_url = database_url
+
+        # SECURITY: Validate schema name to prevent SQL injection
+        if not self._VALID_IDENTIFIER_PATTERN.match(schema):
+            raise ValueError(
+                f"Invalid schema name '{schema}': must contain only letters, digits, "
+                "and underscores, and start with a letter or underscore"
+            )
         self.schema = schema
         self._initialized = False
 

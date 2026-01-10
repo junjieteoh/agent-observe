@@ -25,6 +25,8 @@ from agent_observe.context import (
     set_current_span,
 )
 from agent_observe.hashing import hash_json
+from agent_observe.hooks.context import ErrorContext, ModelContext, ToolContext
+from agent_observe.hooks.result import HookAction
 
 logger = logging.getLogger(__name__)
 
@@ -544,18 +546,69 @@ class ToolDecorator:
         # Set as current span
         token = set_current_span(span)
 
+        # Convert args to list for hook modification
+        current_args = list(args)
+        current_kwargs = dict(kwargs)
+
         try:
+            # Run before_tool hooks
+            hooks = observe._hooks
+            if hooks is not None:
+                tool_ctx = ToolContext(
+                    run=run,
+                    span=span,
+                    observe=observe,
+                    tool_name=tool_name,
+                    tool_kind=tool_kind,
+                    tool_version=tool_version,
+                    args=current_args,
+                    kwargs=current_kwargs,
+                    timestamp_ms=now_ms(),
+                )
+                current_args, current_kwargs, hook_result = hooks.run_before_hooks(
+                    "before_tool", tool_ctx, current_args, current_kwargs
+                )
+
+                if hook_result is not None:
+                    if hook_result.action == HookAction.BLOCK:
+                        from agent_observe.policy import PolicyViolationError
+                        span.set_status(SpanStatus.BLOCKED, hook_result.reason or "Blocked by hook")
+                        span.set_attribute("hook.blocked_by", hook_result.hook_name)
+                        raise PolicyViolationError(
+                            hook_result.reason or "Blocked by hook",
+                            rule=f"hook:{hook_result.hook_name}",
+                        )
+                    elif hook_result.action == HookAction.SKIP:
+                        span.set_attribute("hook.skipped_by", hook_result.hook_name)
+                        span.set_status(SpanStatus.OK)
+                        return hook_result.result
+
             # Try replay cache first
             replay_cache = observe.replay_cache
 
             def execute() -> Any:
-                return fn(*args, **kwargs)
+                return fn(*current_args, **current_kwargs)
 
             result, was_cached = replay_cache.execute_with_cache(
-                tool_name, args_for_hash, execute, tool_version
+                tool_name, {"args": current_args, "kwargs": current_kwargs}, execute, tool_version
             )
 
             span.set_attribute("replay.hit", was_cached)
+
+            # Run after_tool hooks
+            if hooks is not None:
+                tool_ctx = ToolContext(
+                    run=run,
+                    span=span,
+                    observe=observe,
+                    tool_name=tool_name,
+                    tool_kind=tool_kind,
+                    tool_version=tool_version,
+                    args=current_args,
+                    kwargs=current_kwargs,
+                    timestamp_ms=now_ms(),
+                )
+                result = hooks.run_after_hooks("after_tool", tool_ctx, result)
 
             # Hash result
             result_hash = hash_json(result)
@@ -584,6 +637,17 @@ class ToolDecorator:
             return result
 
         except Exception as e:
+            # Run on_tool_error hooks
+            if hooks is not None:
+                error_ctx = ErrorContext(
+                    run=run,
+                    span=span,
+                    observe=observe,
+                    error=e,
+                    timestamp_ms=now_ms(),
+                )
+                hooks.run_error_hooks("on_tool_error", error_ctx, e)
+
             # Enhanced error context
             error_capture_mode = run.get_capture_mode()
             error_context = _format_error_context(e, error_capture_mode, args_for_hash)
@@ -631,11 +695,62 @@ class ToolDecorator:
         # Set as current span
         token = set_current_span(span)
 
+        # Convert args to list for hook modification
+        current_args = list(args)
+        current_kwargs = dict(kwargs)
+
         try:
+            # Run before_tool hooks
+            hooks = observe._hooks
+            if hooks is not None:
+                tool_ctx = ToolContext(
+                    run=run,
+                    span=span,
+                    observe=observe,
+                    tool_name=tool_name,
+                    tool_kind=tool_kind,
+                    tool_version=tool_version,
+                    args=current_args,
+                    kwargs=current_kwargs,
+                    timestamp_ms=now_ms(),
+                )
+                current_args, current_kwargs, hook_result = await hooks.run_before_hooks_async(
+                    "before_tool", tool_ctx, current_args, current_kwargs
+                )
+
+                if hook_result is not None:
+                    if hook_result.action == HookAction.BLOCK:
+                        from agent_observe.policy import PolicyViolationError
+                        span.set_status(SpanStatus.BLOCKED, hook_result.reason or "Blocked by hook")
+                        span.set_attribute("hook.blocked_by", hook_result.hook_name)
+                        raise PolicyViolationError(
+                            hook_result.reason or "Blocked by hook",
+                            rule=f"hook:{hook_result.hook_name}",
+                        )
+                    elif hook_result.action == HookAction.SKIP:
+                        span.set_attribute("hook.skipped_by", hook_result.hook_name)
+                        span.set_status(SpanStatus.OK)
+                        return hook_result.result
+
             # Note: Replay cache doesn't support async yet, execute directly
-            result = await fn(*args, **kwargs)
+            result = await fn(*current_args, **current_kwargs)
 
             span.set_attribute("replay.hit", False)
+
+            # Run after_tool hooks
+            if hooks is not None:
+                tool_ctx = ToolContext(
+                    run=run,
+                    span=span,
+                    observe=observe,
+                    tool_name=tool_name,
+                    tool_kind=tool_kind,
+                    tool_version=tool_version,
+                    args=current_args,
+                    kwargs=current_kwargs,
+                    timestamp_ms=now_ms(),
+                )
+                result = await hooks.run_after_hooks_async("after_tool", tool_ctx, result)
 
             # Hash result
             result_hash = hash_json(result)
@@ -664,6 +779,17 @@ class ToolDecorator:
             return result
 
         except Exception as e:
+            # Run on_tool_error hooks
+            if hooks is not None:
+                error_ctx = ErrorContext(
+                    run=run,
+                    span=span,
+                    observe=observe,
+                    error=e,
+                    timestamp_ms=now_ms(),
+                )
+                await hooks.run_error_hooks_async("on_tool_error", error_ctx, e)
+
             # Enhanced error context
             error_capture_mode = run.get_capture_mode()
             error_context = _format_error_context(e, error_capture_mode, args_for_hash)
@@ -796,13 +922,21 @@ class ModelCallDecorator:
         # Set as current span
         token = set_current_span(span)
 
+        # Convert args to list for hook modification
+        current_args = list(args)
+        current_kwargs = dict(kwargs)
+
+        # Extract LLM context for hooks
+        llm_context = _extract_llm_context(args, kwargs)
+        messages = llm_context.get("messages") if llm_context else None
+        system_prompt = llm_context.get("system_prompt") if llm_context else None
+
         # Hash input
         input_for_hash = {"args": args, "kwargs": kwargs}
         input_hash = hash_json(input_for_hash)
         span.set_attribute("input_hash", input_hash)
 
-        # v0.1.7: Extract and store full LLM context (Wide Event)
-        llm_context = _extract_llm_context(args, kwargs)
+        # v0.1.7: Store full LLM context (Wide Event)
         if llm_context and capture_mode in (CaptureMode.FULL, CaptureMode.EVIDENCE_ONLY):
             llm_context_serialized = _serialize_for_storage(
                 llm_context,
@@ -823,16 +957,66 @@ class ModelCallDecorator:
 
         is_stream_result = False
         try:
-            result = fn(*args, **kwargs)
+            # Run before_model hooks
+            hooks = observe._hooks
+            if hooks is not None:
+                model_ctx = ModelContext(
+                    run=run,
+                    span=span,
+                    observe=observe,
+                    provider=provider,
+                    model=model,
+                    messages=messages,
+                    system_prompt=system_prompt,
+                    args=current_args,
+                    kwargs=current_kwargs,
+                    timestamp_ms=now_ms(),
+                )
+                current_args, current_kwargs, hook_result = hooks.run_before_hooks(
+                    "before_model", model_ctx, current_args, current_kwargs
+                )
+
+                if hook_result is not None:
+                    if hook_result.action == HookAction.BLOCK:
+                        from agent_observe.policy import PolicyViolationError
+                        span.set_status(SpanStatus.BLOCKED, hook_result.reason or "Blocked by hook")
+                        span.set_attribute("hook.blocked_by", hook_result.hook_name)
+                        raise PolicyViolationError(
+                            hook_result.reason or "Blocked by hook",
+                            rule=f"hook:{hook_result.hook_name}",
+                        )
+                    elif hook_result.action == HookAction.SKIP:
+                        span.set_attribute("hook.skipped_by", hook_result.hook_name)
+                        span.set_status(SpanStatus.OK)
+                        return hook_result.result
+
+            result = fn(*current_args, **current_kwargs)
 
             # Check if result is a stream
             if _is_stream(result):
                 is_stream_result = True
                 # For streams, reset the current span context but DON'T end the span
                 # The stream wrapper will handle finalization when exhausted
+                # Note: after_model hooks are not called for streaming responses
                 if token is not None:
                     reset_current_span(token)
                 return SyncStreamWrapper(result, span, capture_mode, run)
+
+            # Run after_model hooks (non-streaming only)
+            if hooks is not None:
+                model_ctx = ModelContext(
+                    run=run,
+                    span=span,
+                    observe=observe,
+                    provider=provider,
+                    model=model,
+                    messages=messages,
+                    system_prompt=system_prompt,
+                    args=current_args,
+                    kwargs=current_kwargs,
+                    timestamp_ms=now_ms(),
+                )
+                result = hooks.run_after_hooks("after_model", model_ctx, result)
 
             # Non-streaming: hash and store output
             output_hash = hash_json(result)
@@ -856,6 +1040,17 @@ class ModelCallDecorator:
             return result
 
         except Exception as e:
+            # Run on_model_error hooks
+            if hooks is not None:
+                error_ctx = ErrorContext(
+                    run=run,
+                    span=span,
+                    observe=observe,
+                    error=e,
+                    timestamp_ms=now_ms(),
+                )
+                hooks.run_error_hooks("on_model_error", error_ctx, e)
+
             # Enhanced error context
             error_context = _format_error_context(e, capture_mode, input_for_hash)
             span.set_attribute("error_context", error_context)
@@ -899,13 +1094,21 @@ class ModelCallDecorator:
         # Set as current span
         token = set_current_span(span)
 
+        # Convert args to list for hook modification
+        current_args = list(args)
+        current_kwargs = dict(kwargs)
+
+        # Extract LLM context for hooks
+        llm_context = _extract_llm_context(args, kwargs)
+        messages = llm_context.get("messages") if llm_context else None
+        system_prompt = llm_context.get("system_prompt") if llm_context else None
+
         # Hash input
         input_for_hash = {"args": args, "kwargs": kwargs}
         input_hash = hash_json(input_for_hash)
         span.set_attribute("input_hash", input_hash)
 
-        # v0.1.7: Extract and store full LLM context (Wide Event)
-        llm_context = _extract_llm_context(args, kwargs)
+        # v0.1.7: Store full LLM context (Wide Event)
         if llm_context and capture_mode in (CaptureMode.FULL, CaptureMode.EVIDENCE_ONLY):
             llm_context_serialized = _serialize_for_storage(
                 llm_context,
@@ -926,16 +1129,66 @@ class ModelCallDecorator:
 
         is_stream_result = False
         try:
-            result = await fn(*args, **kwargs)
+            # Run before_model hooks
+            hooks = observe._hooks
+            if hooks is not None:
+                model_ctx = ModelContext(
+                    run=run,
+                    span=span,
+                    observe=observe,
+                    provider=provider,
+                    model=model,
+                    messages=messages,
+                    system_prompt=system_prompt,
+                    args=current_args,
+                    kwargs=current_kwargs,
+                    timestamp_ms=now_ms(),
+                )
+                current_args, current_kwargs, hook_result = await hooks.run_before_hooks_async(
+                    "before_model", model_ctx, current_args, current_kwargs
+                )
+
+                if hook_result is not None:
+                    if hook_result.action == HookAction.BLOCK:
+                        from agent_observe.policy import PolicyViolationError
+                        span.set_status(SpanStatus.BLOCKED, hook_result.reason or "Blocked by hook")
+                        span.set_attribute("hook.blocked_by", hook_result.hook_name)
+                        raise PolicyViolationError(
+                            hook_result.reason or "Blocked by hook",
+                            rule=f"hook:{hook_result.hook_name}",
+                        )
+                    elif hook_result.action == HookAction.SKIP:
+                        span.set_attribute("hook.skipped_by", hook_result.hook_name)
+                        span.set_status(SpanStatus.OK)
+                        return hook_result.result
+
+            result = await fn(*current_args, **current_kwargs)
 
             # Check if result is an async stream
             if _is_async_stream(result):
                 is_stream_result = True
                 # For streams, reset the current span context but DON'T end the span
                 # The stream wrapper will handle finalization when exhausted
+                # Note: after_model hooks are not called for streaming responses
                 if token is not None:
                     reset_current_span(token)
                 return AsyncStreamWrapper(result, span, capture_mode, run)
+
+            # Run after_model hooks (non-streaming only)
+            if hooks is not None:
+                model_ctx = ModelContext(
+                    run=run,
+                    span=span,
+                    observe=observe,
+                    provider=provider,
+                    model=model,
+                    messages=messages,
+                    system_prompt=system_prompt,
+                    args=current_args,
+                    kwargs=current_kwargs,
+                    timestamp_ms=now_ms(),
+                )
+                result = await hooks.run_after_hooks_async("after_model", model_ctx, result)
 
             # Non-streaming: hash and store output
             output_hash = hash_json(result)
@@ -959,6 +1212,17 @@ class ModelCallDecorator:
             return result
 
         except Exception as e:
+            # Run on_model_error hooks
+            if hooks is not None:
+                error_ctx = ErrorContext(
+                    run=run,
+                    span=span,
+                    observe=observe,
+                    error=e,
+                    timestamp_ms=now_ms(),
+                )
+                await hooks.run_error_hooks_async("on_model_error", error_ctx, e)
+
             # Enhanced error context
             error_context = _format_error_context(e, capture_mode, input_for_hash)
             span.set_attribute("error_context", error_context)

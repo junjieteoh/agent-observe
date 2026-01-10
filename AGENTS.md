@@ -425,6 +425,177 @@ agent-observe view
 # Open http://localhost:8765
 ```
 
+## Lifecycle Hooks (v0.2)
+
+Hooks let you inject custom logic at key points in execution:
+
+```python
+from agent_observe import observe, HookResult
+
+# Block dangerous operations
+@observe.hooks.before_tool
+def security_gate(ctx):
+    if ctx.tool_name in BLOCKED_TOOLS:
+        return HookResult.block(f"Tool {ctx.tool_name} is blocked")
+    return HookResult.proceed()
+
+# Modify inputs before execution
+@observe.hooks.before_tool
+def sanitize_sql(ctx):
+    if ctx.tool_name == "execute_query":
+        cleaned = sanitize_sql_input(ctx.args[0])
+        return HookResult.modify(args=(cleaned,), kwargs=ctx.kwargs)
+    return HookResult.proceed()
+
+# Track costs after model calls
+@observe.hooks.after_model
+def track_cost(ctx, result):
+    if hasattr(result, 'usage'):
+        cost = calculate_cost(result.usage)
+        ctx.span.set_attribute("cost_usd", cost)
+    return result
+
+# Log at run start/end
+@observe.hooks.on_run_start
+def log_start(ctx):
+    print(f"Starting run: {ctx.run.name}")
+
+@observe.hooks.on_run_end
+def log_end(ctx):
+    print(f"Run completed in {ctx.duration_ms}ms with status: {ctx.status}")
+```
+
+### Hook Types
+
+| Hook | When it Runs | Can Block? |
+|------|--------------|------------|
+| `before_tool` | Before tool execution | Yes |
+| `after_tool` | After tool returns | No |
+| `before_model` | Before LLM call | Yes |
+| `after_model` | After LLM returns | No |
+| `on_run_start` | When run begins | No |
+| `on_run_end` | When run completes | No |
+
+### HookResult Actions
+
+| Action | Effect |
+|--------|--------|
+| `HookResult.proceed()` | Continue normal execution |
+| `HookResult.block(reason)` | Stop execution, raise error |
+| `HookResult.skip(result)` | Skip execution, return provided result |
+| `HookResult.modify(args, kwargs)` | Change arguments before execution |
+
+## PII Handling (v0.2)
+
+Automatically redact sensitive data before storage:
+
+```python
+from agent_observe import observe, PIIConfig
+
+observe.install(
+    pii=PIIConfig(
+        enabled=True,
+        action="redact",  # or "hash", "tokenize", "flag"
+        patterns={
+            "email": True,
+            "phone": True,
+            "ssn": True,
+            "credit_card": True,
+            # Custom patterns
+            "employee_id": r"EMP-\d{6}",
+            "api_key": r"sk-[a-zA-Z0-9]{32}",
+        },
+    )
+)
+```
+
+**Built-in patterns**: `email`, `phone`, `ssn`, `credit_card`, `ip_address`, `date_of_birth`, `api_key`, `aws_key`
+
+## Circuit Breaker (v0.2)
+
+Protect your agent from failing hooks:
+
+```python
+from agent_observe import observe, CircuitBreakerConfig, HookRegistry
+
+# Create registry with circuit breaker
+registry = HookRegistry(
+    circuit_breaker=CircuitBreakerConfig(
+        enabled=True,
+        failure_threshold=5,    # Open after 5 failures
+        window_seconds=60,      # Within 60 seconds
+        recovery_seconds=300,   # Try again after 5 minutes
+    )
+)
+
+# Or configure on existing hooks
+observe.hooks.set_circuit_breaker(CircuitBreakerConfig(
+    failure_threshold=3,
+    window_seconds=30,
+))
+```
+
+## Which Example Should I Run?
+
+Start with the example that matches what you want to learn:
+
+| I want to... | Run this example |
+|--------------|------------------|
+| **Get started quickly** | `python examples/basic_usage.py` |
+| **See a real agent workflow** | `python examples/customer_support_agent.py` |
+| **Control LLM costs** | `python examples/rag_agent_with_budget.py` |
+| **Block dangerous operations** | `python examples/hooks_example.py` |
+| **Protect customer PII** | `python examples/pii_handling.py` |
+| **Use async/await** | `python examples/async_agent.py` |
+| **Set up allow/deny rules** | `python examples/with_policy.py` |
+| **Query stored traces** | `python examples/query_runs.py` |
+| **Understand capture modes** | `python examples/capture_modes.py` |
+
+### By Use Case
+
+**Building a Customer-Facing Agent?**
+```bash
+# Start here - shows PII protection, audit trail, ticketing
+python examples/customer_support_agent.py
+```
+
+**Building a RAG System?**
+```bash
+# Shows budget enforcement, caching, cost tracking
+python examples/rag_agent_with_budget.py
+```
+
+**Need Security Guardrails?**
+```bash
+# Shows blocking, input sanitization, security hooks
+python examples/hooks_example.py
+```
+
+**Need GDPR/HIPAA Compliance?**
+```bash
+# Shows redaction, hashing, tokenization of PII
+python examples/pii_handling.py
+```
+
+**Just Want to See Traces?**
+```bash
+# Minimal setup, then view in UI
+python examples/basic_usage.py
+agent-observe view
+```
+
+### Feature Matrix
+
+| Example | Hooks | PII | Policy | Cost Tracking | Caching | Async |
+|---------|:-----:|:---:|:------:|:-------------:|:-------:|:-----:|
+| `basic_usage.py` | | | | | | |
+| `customer_support_agent.py` | ✓ | ✓ | | ✓ | | |
+| `rag_agent_with_budget.py` | ✓ | | | ✓ | ✓ | |
+| `hooks_example.py` | ✓ | | | ✓ | ✓ | |
+| `pii_handling.py` | | ✓ | | | | |
+| `with_policy.py` | | | ✓ | | | |
+| `async_agent.py` | | | | | | ✓ |
+
 ## Quick Checklist
 
 1. `observe.install(config=Config(mode="full", env="dev"))` at startup
@@ -432,6 +603,8 @@ agent-observe view
 3. `@model_call(provider="...", model="...")` on all LLM calls
 4. `observe.run("agent-name")` around agent execution (tools must be called INSIDE this context)
 5. `observe.emit_artifact()` for final outputs
+6. (Optional) Add hooks for security, cost tracking, or custom logic
+7. (Optional) Enable PII handling for compliance
 
 ## Latest Model IDs (January 2025)
 

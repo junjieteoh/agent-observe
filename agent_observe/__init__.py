@@ -16,7 +16,18 @@ Usage:
 
 from agent_observe.context import RunContext, SpanContext, SpanKind, SpanStatus
 from agent_observe.decorators import model_call, tool
+from agent_observe.hooks import (
+    CircuitBreakerConfig,
+    HookAction,
+    HookRegistry,
+    HookResult,
+    ModelContext,
+    RunEndContext,
+    RunStartContext,
+    ToolContext,
+)
 from agent_observe.observe import observe
+from agent_observe.pii import PIIAction, PIIConfig, PIIHandler
 from agent_observe.policy import PolicyViolationError
 
 __all__ = [
@@ -29,6 +40,19 @@ __all__ = [
     "SpanContext",
     "SpanKind",
     "SpanStatus",
+    # Hook types
+    "HookAction",
+    "HookResult",
+    "HookRegistry",
+    "ToolContext",
+    "ModelContext",
+    "RunStartContext",
+    "RunEndContext",
+    "CircuitBreakerConfig",
+    # PII types
+    "PIIConfig",
+    "PIIHandler",
+    "PIIAction",
     # Exceptions
     "PolicyViolationError",
 ]

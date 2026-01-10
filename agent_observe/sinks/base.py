@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from agent_observe.config import Config
     from agent_observe.context import RunContext, SpanContext
+    from agent_observe.pii import PIIHandler
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ class Sink(ABC):
         queue_size: int = 10000,
         flush_interval: float = 1.0,
         max_retries: int = 3,
+        pii_handler: PIIHandler | None = None,
     ):
         """
         Initialize the sink.
@@ -81,6 +83,7 @@ class Sink(ABC):
             queue_size: Maximum queue size for async writes.
             flush_interval: Seconds between background flushes.
             max_retries: Maximum retry attempts for failed writes.
+            pii_handler: Optional PII handler for pre-storage redaction/hashing.
         """
         self.async_writes = async_writes
         self._queue: queue.Queue[WriteRequest | None] = queue.Queue(maxsize=queue_size)
@@ -90,6 +93,31 @@ class Sink(ABC):
         self._writer_thread: threading.Thread | None = None
         self._initialized = False
         self._metrics = SinkMetrics()
+        self._pii_handler = pii_handler
+
+    @property
+    def pii_handler(self) -> PIIHandler | None:
+        """Get the PII handler if configured."""
+        return self._pii_handler
+
+    @pii_handler.setter
+    def pii_handler(self, handler: PIIHandler | None) -> None:
+        """Set the PII handler."""
+        self._pii_handler = handler
+
+    def _process_pii(self, data: dict[str, Any]) -> dict[str, Any]:
+        """
+        Process data through the PII handler if configured.
+
+        Args:
+            data: Data dictionary to process.
+
+        Returns:
+            Processed data with PII handled (redacted/hashed/etc).
+        """
+        if self._pii_handler is None:
+            return data
+        return self._pii_handler.process(data)
 
     @property
     def queue_depth(self) -> int:
@@ -299,10 +327,13 @@ class Sink(ABC):
         """
         Write a run to the sink.
 
+        PII processing is applied before storage if a handler is configured.
+
         Args:
             run: RunContext or dict representation.
         """
         data = run.to_dict() if hasattr(run, "to_dict") else run
+        data = self._process_pii(data)
 
         if self.async_writes:
             self._enqueue(WriteType.RUN, data)
@@ -313,10 +344,13 @@ class Sink(ABC):
         """
         Write a span to the sink.
 
+        PII processing is applied before storage if a handler is configured.
+
         Args:
             span: SpanContext or dict representation.
         """
         data = span.to_dict() if hasattr(span, "to_dict") else span
+        data = self._process_pii(data)
 
         if self.async_writes:
             self._enqueue(WriteType.SPAN, data)
@@ -327,9 +361,13 @@ class Sink(ABC):
         """
         Write an event to the sink.
 
+        PII processing is applied before storage if a handler is configured.
+
         Args:
             event: Event dictionary.
         """
+        event = self._process_pii(event)
+
         if self.async_writes:
             self._enqueue(WriteType.EVENT, event)
         else:
@@ -459,6 +497,12 @@ def create_sink(config: Config) -> Sink:
         Configured Sink instance.
     """
     from agent_observe.config import CaptureMode, SinkType
+    from agent_observe.pii import create_pii_handler
+
+    # Create PII handler if configured
+    pii_handler = create_pii_handler(config.pii)
+    if pii_handler:
+        logger.info(f"PII handling enabled with action: {pii_handler.config.action}")
 
     # If observability is off, use null sink
     if config.mode == CaptureMode.OFF:
@@ -468,23 +512,25 @@ def create_sink(config: Config) -> Sink:
     sink_type = config.resolve_sink_type()
     logger.info(f"Creating {sink_type.value} sink")
 
+    sink: Sink | None = None
+
     try:
         if sink_type == SinkType.SQLITE:
             from agent_observe.sinks.sqlite_sink import SQLiteSink
 
-            return SQLiteSink(path=config.sqlite_path)
+            sink = SQLiteSink(path=config.sqlite_path)
 
         elif sink_type == SinkType.JSONL:
             from agent_observe.sinks.jsonl_sink import JSONLSink
 
-            return JSONLSink(directory=config.jsonl_dir)
+            sink = JSONLSink(directory=config.jsonl_dir)
 
         elif sink_type == SinkType.POSTGRES:
             from agent_observe.sinks.postgres_sink import PostgresSink
 
             if not config.database_url:
                 raise ValueError("DATABASE_URL required for Postgres sink")
-            return PostgresSink(
+            sink = PostgresSink(
                 database_url=config.database_url,
                 schema=config.pg_schema,
             )
@@ -494,20 +540,29 @@ def create_sink(config: Config) -> Sink:
 
             if not config.otlp_endpoint:
                 raise ValueError("OTEL_EXPORTER_OTLP_ENDPOINT required for OTLP sink")
-            return OTLPSink(endpoint=config.otlp_endpoint)
+            sink = OTLPSink(endpoint=config.otlp_endpoint)
 
         else:
             # Fallback to JSONL
             logger.warning(f"Unknown sink type {sink_type}, falling back to JSONL")
             from agent_observe.sinks.jsonl_sink import JSONLSink
 
-            return JSONLSink(directory=config.jsonl_dir)
+            sink = JSONLSink(directory=config.jsonl_dir)
+
+        # Set PII handler on the sink
+        if sink and pii_handler:
+            sink.pii_handler = pii_handler
+
+        return sink
 
     except ImportError as e:
         logger.warning(f"Failed to import sink {sink_type.value}: {e}, falling back to JSONL")
         from agent_observe.sinks.jsonl_sink import JSONLSink
 
-        return JSONLSink(directory=config.jsonl_dir)
+        fallback = JSONLSink(directory=config.jsonl_dir)
+        if pii_handler:
+            fallback.pii_handler = pii_handler
+        return fallback
 
     except Exception as e:
         logger.error(f"Failed to create sink {sink_type.value}: {e}, falling back to NullSink")

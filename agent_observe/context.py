@@ -367,17 +367,21 @@ class RunContext:
         if self._observe is None or not self._spans:
             return
 
+        spans_to_flush = len(self._spans)
         try:
             for span in self._spans:
                 self._observe.sink.write_span(span.to_dict())
-            self._flushed_span_count += len(self._spans)
+            self._flushed_span_count += spans_to_flush
             logger.debug(
-                f"Flushed {len(self._spans)} spans to sink "
+                f"Flushed {spans_to_flush} spans to sink "
                 f"(total flushed: {self._flushed_span_count})"
             )
-            self._spans.clear()
         except Exception as e:
             logger.warning(f"Failed to flush spans: {e}")
+        finally:
+            # IMPORTANT: Clear spans even on failure to prevent unbounded memory growth
+            # Spans are best-effort; losing them is better than OOM
+            self._spans.clear()
 
     def add_event(self, event: dict[str, Any]) -> None:
         """Record an event in this run."""

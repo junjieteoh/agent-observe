@@ -12,6 +12,10 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent_observe.pii import PIIConfig
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +141,9 @@ class Config:
     # Size caps
     max_event_payload_bytes: int = 16 * 1024  # 16KB
     max_artifact_bytes: int = 64 * 1024  # 64KB
+
+    # PII configuration (optional, disabled by default)
+    pii: PIIConfig | dict | None = None
 
     def __post_init__(self) -> None:
         """Convert string values to enums."""
